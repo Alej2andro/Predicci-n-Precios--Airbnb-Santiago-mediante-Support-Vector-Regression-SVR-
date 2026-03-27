@@ -1,0 +1,1533 @@
+---
+title: "SVM Regresión aplicado a Precios Airbnb Santiago"
+subtitle: "Preprocesamiento · Selección de Características · Regresión · Puesta en Operación"
+author: "Alejandro Figueroa Rojas | Ingeniero Comercial — Data & Business Intelligence"
+date: today
+lang: es
+format:
+  html:
+    theme: flatly
+    highlight-style: arrow
+    toc: true
+    toc-depth: 4
+    toc-title: "Contenidos"
+    toc-location: left
+    number-sections: true
+    fig-align: center
+    fig-width: 9
+    fig-height: 6
+    embed-resources: true
+    smooth-scroll: true
+    page-layout: full
+execute:
+  warning: false
+  message: false
+  echo: true
+  cache: false
+---
+
+```{=html}
+<style>
+body { font-family: 'Georgia', serif; font-size: 15px; line-height: 1.75; }
+h1, h2, h3, h4 { font-family: 'Helvetica Neue', sans-serif; color: #2c3e50; }
+.callout-note      { border-left: 4px solid #3498db; }
+.callout-tip       { border-left: 4px solid #2ecc71; }
+.callout-important { border-left: 4px solid #e74c3c; }
+blockquote { background: #f8f9fa; border-left: 4px solid #6c757d;
+             padding: 0.8em 1.2em; font-style: italic; }
+</style>
+```
+
+---
+
+# Motivación
+
+> *"Un modelo que no entiende el mercado que predice, no predice: adivina."*
+> — Alejandro Figueroa Rojas
+
+El mercado de alquileres de corto plazo en Santiago ha crecido de forma acelerada. Detrás de cada precio publicado en Airbnb existe una estructura compleja: ubicación, tipo de propiedad, reputación del anfitrión, características físicas y políticas de cancelación, todo actuando de forma conjunta y no lineal.
+
+Este proyecto aplica **Support Vector Regression (SVR)** con kernel RBF al dataset público de Inside Airbnb Santiago (diciembre 2024) para **predecir el precio de publicación** de un alojamiento, siguiendo el esquema formal de preprocesamiento: **EDA → Categorización → Clean Algorithm → Normalización MinMax → Selección de Características Comparativa → SVR**. Cada decisión tiene justificación matemática y metodológica explícita.
+
+:::{.callout-note}
+**Esquema metodológico: ** Dataset → Limpieza → Normalización → Selección comparativa → SVR → Evaluación.
+La normalización se aprende **solo en Train** y se aplica a Test para evitar *data leakage*.
+:::
+
+**Fases del pipeline:**
+
+| Fase | Pasos | Descripción |
+|---|---|---|
+| 1 — Datos | 1–3 | Carga, inventario, categorización de variables |
+| 2 — Preprocesamiento | 4–7 | Filtro precio, EDA, encoding, imputación |
+| 3 — Split + Clean + Norm | 8–10 | Train/Test, Clean Algorithm, MinMax |
+| 4 — Selección variables | 11–12 | 6 selectores comparativos con k* y CV-5 |
+| 5 — Modelamiento | 13–15 | SVR RBF, Grid Search, validación cruzada |
+| 6 — Evaluación | 16–17 | Métricas Train/Test, residuos, escala original |
+| 7 — Operación | 18–19 | Datos nuevos, segmentación y accionabilidad |
+
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(comment="", message=FALSE, warning=FALSE,
+                      fig.align="center", fig.width=10, fig.height=6)
+```
+
+# Librerías y Configuración
+
+```{r libraries}
+
+library(tidyverse); library(e1071);    library(caret)
+library(gridExtra); library(scales);   library(kableExtra)
+library(moments);   library(igraph);   library(corrplot)
+library(randomForest); library(glmnet); library(xgboost)
+
+select <- dplyr::select; filter <- dplyr::filter; mutate <- dplyr::mutate
+
+theme_set(
+  theme_minimal(base_size=12) +
+    theme(plot.title    = element_text(face="bold", size=13, hjust=0.5),
+          plot.subtitle = element_text(color="grey45", hjust=0.5),
+          strip.text    = element_text(face="bold"))
+)
+set.seed(42)
+```
+
+---
+
+# Carga y Exploración del Dataset Bruto
+
+> **Datos:** Descarga `listings.csv.gz` de [Inside Airbnb — Santiago](https://insideairbnb.com/get-the-data/) 
+> y ajusta la ruta en el chunk `load-raw` antes de renderizar.
+
+> **Nota:** El chunk `load-raw` usa `echo=FALSE` para no exponer rutas locales.
+
+```{r load-raw, echo=FALSE}
+
+datos_raw <- readr::read_csv(
+  "C:/Users/ASUS/Desktop/MaterialMachinlearning/CursoML-CienciaDatos(UAI)/unidad 5/SVM-Regression/listings.csv.gz"
+)
+cat(sprintf("Dataset bruto: %d observaciones × %d variables\n", nrow(datos_raw), ncol(datos_raw)))
+```
+
+## Inventario completo de variables
+
+```{r inventario}
+inventario <- tibble(
+  variable    = names(datos_raw),
+  tipo_r      = map_chr(datos_raw, ~ class(.x)[1]),
+  n_distintos = map_int(datos_raw, ~ n_distinct(.x, na.rm=TRUE)),
+  pct_na      = round(map_dbl(datos_raw, ~ mean(is.na(.x)))*100, 1),
+  ejemplo     = map_chr(datos_raw, ~ { v <- na.omit(as.character(.x)); if(length(v)==0) "—" else substr(v[1],1,40) })
+) |> mutate(
+  clase_stat = case_when(
+    tipo_r %in% c("numeric","integer") & n_distintos==2 ~ "Binaria/Booleana",
+    tipo_r %in% c("numeric","integer")                  ~ "Numérica continua",
+    tipo_r == "logical"                                  ~ "Lógica (booleana)",
+    tipo_r %in% c("Date","POSIXct","POSIXlt")            ~ "Fecha/Tiempo",
+    tipo_r == "character" & n_distintos <= 10            ~ "Categórica (≤10 niveles)",
+    tipo_r == "character" & n_distintos <= 80            ~ "Categórica (11–80 niveles)",
+    TRUE                                                 ~ "Texto libre / ID / URL"
+  )
+) |> arrange(clase_stat, desc(pct_na))
+
+inventario |>
+  kbl(caption="Inventario completo — variables del dataset bruto",
+      col.names=c("Variable","Tipo R","N° únicos","% NA","Ejemplo","Clase estadística")) |>
+  kable_styling(bootstrap_options=c("striped","hover","condensed"), full_width=FALSE, font_size=11) |>
+  column_spec(6, bold=TRUE) |> scroll_box(width="100%", height="600px")
+```
+
+---
+
+# Categorización y Decisión por Variable
+
+```{r decision-vars}
+decision_vars <- tribble(
+  ~variable,                                       ~decision,           ~razon,
+  "price",                                         "OBJETIVO",          "Variable respuesta → log1p(price)",
+  "id",                                            "ELIMINAR_DIRECTA",  "Identificador único",
+  "listing_url",                                   "ELIMINAR_DIRECTA",  "URL",
+  "scrape_id",                                     "ELIMINAR_DIRECTA",  "ID técnico scraping",
+  "name",                                          "ELIMINAR_DIRECTA",  "Texto libre",
+  "description",                                   "ELIMINAR_DIRECTA",  "Texto libre",
+  "neighborhood_overview",                         "ELIMINAR_DIRECTA",  "Texto libre",
+  "picture_url",                                   "ELIMINAR_DIRECTA",  "URL",
+  "host_id",                                       "ELIMINAR_DIRECTA",  "ID anfitrión",
+  "host_url",                                      "ELIMINAR_DIRECTA",  "URL",
+  "host_name",                                     "ELIMINAR_DIRECTA",  "Texto libre",
+  "host_about",                                    "ELIMINAR_DIRECTA",  "Texto libre",
+  "host_thumbnail_url",                            "ELIMINAR_DIRECTA",  "URL",
+  "host_picture_url",                              "ELIMINAR_DIRECTA",  "URL",
+  "host_neighbourhood",                            "ELIMINAR_DIRECTA",  "Texto libre/inconsistente",
+  "host_verifications",                            "ELIMINAR_DIRECTA",  "Lista texto — requeriría NLP",
+  "amenities",                                     "ELIMINAR_DIRECTA",  "Lista texto — requeriría NLP",
+  "host_listings_count",                           "ELIMINAR_DIRECTA",  "Redundante con calculated_host_listings_count",
+  "host_total_listings_count",                     "ELIMINAR_DIRECTA",  "Redundante con calculated_host_listings_count",
+  "calendar_updated",                              "ELIMINAR_DIRECTA",  "Texto/fecha sin valor predictivo",
+  "license",                                       "ELIMINAR_DIRECTA",  "Texto legal",
+  "bathrooms",                                     "ELIMINAR_DIRECTA",  "Casi vacía; reemplazada por bathrooms_text",
+  "latitude",                                      "ELIMINAR_DIRECTA",  "Redundante con neighbourhood_cleansed",
+  "longitude",                                     "ELIMINAR_DIRECTA",  "Redundante con neighbourhood_cleansed",
+  "last_scraped",                                  "ELIMINAR_FECHA",    "Fecha técnica",
+  "host_since",                                    "ELIMINAR_FECHA",    "Capturada indirectamente por otras vars",
+  "calendar_last_scraped",                         "ELIMINAR_FECHA",    "Fecha técnica",
+  "first_review",                                  "ELIMINAR_FECHA",    "Proxy: number_of_reviews",
+  "last_review",                                   "ELIMINAR_FECHA",    "Proxy: reviews_per_month",
+  "bathrooms_text",                                "PROCESAR_ESPECIAL", "Extraer número → bathrooms_num",
+  "host_response_rate",                            "PROCESAR_ESPECIAL", "Limpiar % → numérico",
+  "host_acceptance_rate",                          "PROCESAR_ESPECIAL", "Limpiar % → numérico",
+  "accommodates",                                  "PROCESAR_NUM",      "Capacidad — alta relevancia precio",
+  "bedrooms",                                      "PROCESAR_NUM",      "Habitaciones",
+  "beds",                                          "PROCESAR_NUM",      "Camas",
+  "minimum_nights",                                "PROCESAR_NUM",      "Política — influye en precio",
+  "maximum_nights",                                "PROCESAR_NUM",      "Política",
+  "minimum_minimum_nights",                        "PROCESAR_NUM",      "Estadístico — Clean filtrará si correlada",
+  "maximum_minimum_nights",                        "PROCESAR_NUM",      "Estadístico — Clean filtrará si correlada",
+  "minimum_maximum_nights",                        "PROCESAR_NUM",      "Estadístico — Clean filtrará si correlada",
+  "maximum_maximum_nights",                        "PROCESAR_NUM",      "Estadístico — Clean filtrará si correlada",
+  "minimum_nights_avg_ntm",                        "PROCESAR_NUM",      "Promedio — Clean filtrará si correlada",
+  "maximum_nights_avg_ntm",                        "PROCESAR_NUM",      "Promedio — Clean filtrará si correlada",
+  "number_of_reviews",                             "PROCESAR_NUM",      "Popularidad — señal demanda",
+  "number_of_reviews_ltm",                         "PROCESAR_NUM",      "Reviews últimos 12 meses",
+  "number_of_reviews_l30d",                        "PROCESAR_NUM",      "Reviews últimos 30 días",
+  "review_scores_rating",                          "PROCESAR_NUM",      "Score general",
+  "review_scores_accuracy",                        "PROCESAR_NUM",      "Score precisión",
+  "review_scores_cleanliness",                     "PROCESAR_NUM",      "Score limpieza",
+  "review_scores_checkin",                         "PROCESAR_NUM",      "Score check-in",
+  "review_scores_communication",                   "PROCESAR_NUM",      "Score comunicación",
+  "review_scores_location",                        "PROCESAR_NUM",      "Score ubicación — alta relevancia",
+  "review_scores_value",                           "PROCESAR_NUM",      "Score valor percibido",
+  "reviews_per_month",                             "PROCESAR_NUM",      "Frecuencia reseñas — proxy demanda",
+  "calculated_host_listings_count",                "PROCESAR_NUM",      "N° propiedades anfitrión",
+  "calculated_host_listings_count_entire_homes",   "PROCESAR_NUM",      "Desglose — Clean filtrará si correlada",
+  "calculated_host_listings_count_private_rooms",  "PROCESAR_NUM",      "Desglose — Clean filtrará si correlada",
+  "calculated_host_listings_count_shared_rooms",   "PROCESAR_NUM",      "Desglose — Clean filtrará si correlada",
+  "availability_30",                               "PROCESAR_NUM",      "Disponibilidad 30 días",
+  "availability_60",                               "PROCESAR_NUM",      "Disponibilidad 60 días",
+  "availability_90",                               "PROCESAR_NUM",      "Disponibilidad 90 días",
+  "availability_365",                              "PROCESAR_NUM",      "Disponibilidad anual",
+  "host_is_superhost",                             "PROCESAR_BOOL",     "Superhost → señal calidad",
+  "host_has_profile_pic",                          "PROCESAR_BOOL",     "Confianza anfitrión",
+  "host_identity_verified",                        "PROCESAR_BOOL",     "Confianza anfitrión",
+  "instant_bookable",                              "PROCESAR_BOOL",     "Accesibilidad reserva",
+  "has_availability",                              "PROCESAR_BOOL",     "Disponibilidad activa",
+  "room_type",                                     "PROCESAR_CAT",      "Tipo alojamiento — alta discriminación precio",
+  "neighbourhood_cleansed",                        "PROCESAR_CAT",      "Comuna — alta discriminación precio",
+  "neighbourhood_group_cleansed",                  "PROCESAR_CAT",      "Agrupación comunas",
+  "property_type",                                 "PROCESAR_CAT",      "Tipo propiedad",
+  "host_response_time",                            "PROCESAR_CAT",      "Calidad servicio"
+)
+
+decision_vars |>
+  arrange(decision, variable) |>
+  kbl(caption="Categorización y decisión explícita por variable",
+      col.names=c("Variable","Decisión","Razón")) |>
+  kable_styling(bootstrap_options=c("striped","hover","condensed"), full_width=FALSE, font_size=11) |>
+  column_spec(2, bold=TRUE) |> scroll_box(width="100%", height="500px")
+```
+
+:::{.callout-note}
+Variables con estadísticos redundantes se conservan: el **Clean Algorithm** las eliminará si |r| ≥ 0.90, garantizando decisión cuantitativa.
+:::
+
+---
+
+# Preprocesamiento
+
+## Filtro de precio
+
+```{r filtro-precio}
+datos_raw <- datos_raw |>
+  mutate(price = as.numeric(str_remove_all(price, "[$,]"))) |>
+  filter(!is.na(price), price >= 1000, price <= 500000)
+
+cat(sprintf("Observaciones tras filtro precio [1.000–500.000 CLP]: %d\n", nrow(datos_raw)))
+```
+
+## Construcción del dataset base
+
+```{r build-dataset}
+vars_num <- decision_vars |> filter(decision=="PROCESAR_NUM")  |> pull(variable) |> intersect(names(datos_raw))
+vars_bool<- decision_vars |> filter(decision=="PROCESAR_BOOL") |> pull(variable) |> intersect(names(datos_raw))
+vars_cat <- decision_vars |> filter(decision=="PROCESAR_CAT")  |> pull(variable) |> intersect(names(datos_raw))
+
+cols_sel <- intersect(c("price",vars_num,vars_bool,vars_cat,
+                        "bathrooms_text","host_response_rate","host_acceptance_rate"),
+                      names(datos_raw))
+datos <- datos_raw |> select(all_of(cols_sel))
+
+if ("bathrooms_text"      %in% names(datos))
+  datos <- datos |> mutate(bathrooms_num = as.numeric(str_extract(bathrooms_text,"[0-9]+(\\.[0-9]+)?"))) |> select(-bathrooms_text)
+if ("host_response_rate"  %in% names(datos))
+  datos <- datos |> mutate(host_response_rate  = as.numeric(str_remove_all(host_response_rate,"%")))
+if ("host_acceptance_rate"%in% names(datos))
+  datos <- datos |> mutate(host_acceptance_rate= as.numeric(str_remove_all(host_acceptance_rate,"%")))
+
+vars_bool_ok <- intersect(vars_bool, names(datos))
+datos <- datos |>
+  mutate(across(all_of(vars_bool_ok),
+    ~ as.integer(recode(as.character(.x),"t"="1","f"="0","TRUE"="1","FALSE"="0",.default=NA_character_))))
+
+vars_cat_ok <- intersect(vars_cat, names(datos))
+datos <- datos |>
+  mutate(across(all_of(vars_cat_ok), ~ {
+    freq <- prop.table(table(.x)); raras <- names(freq[freq < 0.01])
+    ifelse(.x %in% raras | is.na(.x), "Otro", .x)
+  }))
+
+vars_num_final <- intersect(c(vars_num,"bathrooms_num","host_response_rate","host_acceptance_rate"), names(datos))
+
+cat(sprintf("Dataset base: %d × %d\n", nrow(datos), ncol(datos)))
+```
+
+## Diagnóstico y imputación de valores faltantes
+
+```{r na-imputacion}
+na_diag <- datos |>
+  summarise(across(everything(), ~ round(mean(is.na(.x))*100,1))) |>
+  pivot_longer(everything(), names_to="variable", values_to="pct_na") |>
+  filter(pct_na > 0) |> arrange(desc(pct_na))
+
+na_diag |>
+  kbl(caption="Variables con valores faltantes", col.names=c("Variable","% NA")) |>
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE, font_size=12) |>
+  scroll_box(width="60%", height="300px")
+
+vars_alta_na <- na_diag |> filter(pct_na > 60, variable %in% vars_num_final) |> pull(variable)
+if (length(vars_alta_na) > 0) {
+  cat("Descartadas (>60% NA):", paste(vars_alta_na, collapse=", "),"\n")
+  datos <- datos |> select(-all_of(vars_alta_na))
+  vars_num_final <- setdiff(vars_num_final, vars_alta_na)
+}
+
+datos <- datos |>
+  mutate(across(all_of(intersect(vars_num_final,  names(datos))), ~ ifelse(is.na(.x), median(.x,na.rm=TRUE), .x)),
+         across(all_of(intersect(vars_bool_ok,    names(datos))), ~ { mo <- names(sort(table(.x),decreasing=TRUE))[1]; ifelse(is.na(.x),as.integer(mo),.x) }),
+         across(all_of(intersect(vars_cat_ok,     names(datos))), ~ ifelse(is.na(.x)|.x=="","Otro",.x)))
+
+cat(sprintf("NAs tras imputación: %d\n", sum(is.na(datos))))
+```
+
+## Análisis Exploratorio (EDA)
+
+```{r eda-cat, fig.height=5}
+
+p_rt <- datos |> group_by(room_type) |> summarise(precio_med=median(price)) |>
+  ggplot(aes(x=reorder(room_type,precio_med), y=precio_med, fill=room_type)) +
+  geom_col(show.legend=FALSE, width=0.6) +
+  geom_text(aes(label=comma(round(precio_med))), hjust=-0.1, size=3.5) +
+  coord_flip() + scale_y_continuous(expand=expansion(mult=c(0,0.2))) +
+  labs(title="Precio mediano por tipo de habitación", x=NULL, y="CLP/noche") +
+  scale_fill_brewer(palette="Set2")
+
+p_nb <- datos |> group_by(neighbourhood_cleansed) |>
+  summarise(precio_med=median(price), n=n()) |> filter(n>=20) |> slice_max(precio_med,n=15) |>
+  ggplot(aes(x=reorder(neighbourhood_cleansed,precio_med), y=precio_med, fill=precio_med)) +
+  geom_col(width=0.7, show.legend=FALSE) +
+  geom_text(aes(label=comma(round(precio_med))), hjust=-0.1, size=3) +
+  coord_flip() + scale_fill_gradient(low="#85c1e9",high="#1a5276") +
+  scale_y_continuous(expand=expansion(mult=c(0,0.25))) +
+  labs(title="Top 15 comunas por precio mediano", x=NULL, y="CLP/noche")
+
+grid.arrange(p_rt, p_nb, ncol=2)
+```
+
+## One-Hot Encoding
+
+```{r ohe}
+n_levels    <- sapply(vars_cat_ok, function(v) n_distinct(datos[[v]], na.rm=TRUE))
+vars_cat_ok <- vars_cat_ok[n_levels >= 2]
+
+dummies    <- dummyVars(~., data=datos[, vars_cat_ok], fullRank=TRUE)
+X_cat      <- predict(dummies, newdata=datos) |> as.data.frame()
+X_num_bool <- datos |> select(all_of(intersect(c(vars_num_final,vars_bool_ok), names(datos))))
+X_m        <- bind_cols(X_num_bool, X_cat)
+y          <- log1p(datos$price)
+
+cat(sprintf("Matriz X post-encoding: %d × %d\n", nrow(X_m), ncol(X_m)))
+```
+
+---
+
+# División Train / Test
+
+:::{.callout-important}
+**Principio crítico:** división Train/Test **antes** de normalizar.
+Los parámetros de normalización se aprenden exclusivamente en Train → evita data leakage.
+:::
+
+```{r split}
+idx_tr   <- createDataPartition(y, p=0.75, list=FALSE)
+X_tr_raw <- X_m[idx_tr,];  y_tr <- y[idx_tr]
+X_te_raw <- X_m[-idx_tr,]; y_te <- y[-idx_tr]
+
+cat(sprintf("Train: %d | Test: %d | Features (m): %d\n", nrow(X_tr_raw), nrow(X_te_raw), ncol(X_m)))
+```
+
+---
+
+# Clean Algorithm {#sec-clean}
+
+> **Orden obligatorio:** Clean → Normalización → Feature Selection.
+> Clean opera sobre datos crudos, solo con Train.
+
+## Paso A — Eliminar features constantes (std < 1e-8)
+
+```{r clean-a}
+stds     <- sapply(X_tr_raw, sd, na.rm=TRUE)
+vars_cte <- names(stds[stds < 1e-8])
+if (length(vars_cte) > 0) { cat("Constantes eliminadas:", paste(vars_cte,collapse=", "),"\n") } else { cat("Sin features constantes.\n") }
+X_tr_clean <- X_tr_raw |> select(-any_of(vars_cte))
+X_te_clean <- X_te_raw |> select(-any_of(vars_cte))
+```
+
+## Paso B — Eliminar features altamente correladas (|r| ≥ 0.90)
+
+```{r clean-b}
+CORR_THR <- 0.90; vars_removed_corr <- character(0)
+repeat {
+  cm     <- cor(X_tr_clean, use="pairwise.complete.obs")
+  idx_hi <- which(abs(cm) >= CORR_THR & upper.tri(cm), arr.ind=TRUE)
+  if (nrow(idx_hi)==0) break
+  best <- idx_hi[which.max(abs(cm[idx_hi])),]
+  par  <- colnames(X_tr_clean)[best]
+  rem  <- sample(par,1)
+  cat(sprintf("|r|=%.3f '%s' vs '%s' → elimina '%s'\n", abs(cm[best[1],best[2]]),par[1],par[2],rem))
+  vars_removed_corr <- c(vars_removed_corr, rem)
+  X_tr_clean <- X_tr_clean |> select(-all_of(rem))
+  X_te_clean <- X_te_clean |> select(-all_of(rem))
+}
+cat(sprintf("\nm=%d → constantes=%d → correladas=%d → q=%d features limpias\n",
+            ncol(X_m), length(vars_cte), length(vars_removed_corr), ncol(X_tr_clean)))
+```
+
+---
+
+# Normalización MinMax
+
+$$Y_j = \frac{X_j - \min_j}{\max_j - \min_j} \qquad \Rightarrow \quad Y_j \in [0,\,1]$$
+
+Parámetros aprendidos en Train, aplicados a Train y Test.
+
+```{r normalizacion}
+pp_minmax <- preProcess(X_tr_clean, method="range")
+X_tr_norm <- predict(pp_minmax, X_tr_clean)
+X_te_norm <- predict(pp_minmax, X_te_clean)
+cat(sprintf("X_tr_norm: %d × %d  |  X_te_norm: %d × %d\n",
+            nrow(X_tr_norm), ncol(X_tr_norm), nrow(X_te_norm), ncol(X_te_norm)))
+```
+
+---
+
+# Distribución de la Variable Objetivo
+
+```{r target-dist}
+p1 <- ggplot(datos, aes(x=price)) +
+  geom_histogram(bins=60, fill="#2980b9", alpha=0.75, color="white") +
+  labs(title="Distribución precio (sin transformar)", x="Precio CLP/noche", y="Frecuencia") +
+  scale_x_continuous(labels=comma)
+
+p2 <- ggplot(datos, aes(x=log1p(price))) +
+  geom_histogram(bins=60, fill="#8e44ad", alpha=0.75, color="white") +
+  labs(title="Distribución log1p(precio)", x="log1p(Precio)", y="Frecuencia")
+
+grid.arrange(p1, p2, ncol=2)
+```
+
+:::{.callout-important}
+**Asimetría positiva:** se aplica `log1p` para estabilizar la varianza y aproximar normalidad.
+:::
+
+## Estadísticas descriptivas
+
+```{r desc-stats}
+datos |>
+  select(all_of(intersect(vars_num_final, names(datos)))) |>
+  pivot_longer(everything(), names_to="variable", values_to="valor") |>
+  group_by(variable) |>
+  summarise(media=round(mean(valor),2), mediana=round(median(valor),2),
+            sd=round(sd(valor),2), min=round(min(valor),2),
+            max=round(max(valor),2), asimetria=round(skewness(valor),3)) |>
+  kbl(caption="Estadísticas descriptivas — variables numéricas") |>
+  kable_styling(bootstrap_options=c("striped","hover","condensed"), full_width=FALSE, font_size=12) |>
+  scroll_box(width="100%")
+```
+**Las estadísticas descriptivas revelan tres patrones relevantes para el modelamiento.**
+
+Las variables de **capacidad física** ,`accommodates`, `bedrooms`, `beds`, `bathrooms_num`: presentan medianas bajas (1–2 unidades) con asimetrías positivas pronunciadas, lo que indica que la mayoría de los alojamientos son de tamaño reducido y los inmuebles de gran capacidad son casos atípicos. Esta asimetría justifica que el Clean Algorithm haya retenido estas variables sin transformación adicional, dado que SVR con kernel RBF es robusto ante distribuciones no normales.
+
+Las variables de **disponibilidad** (`availability_30`, `_60`, `_90`, `_365`) muestran asimetrías negativas, señalando que la mayoría de los alojamientos tienen alta disponibilidad. La alta correlación entre ellas es precisamente la que el Clean Algorithm elimina mediante el umbral $|r| \geq 0.90$, reteniendo solo las que aportan información no redundante.
+
+Las variables de **reseñas y scores** presentan el patrón más homogéneo: medias entre 4.7 y 4.9 sobre 5.0 con desviaciones estándar menores a 0.4, y asimetrías fuertemente negativas (hasta $-7.6$). Esto indica un efecto de techo típico en plataformas de reputación: casi todos los anfitriones acumulan calificaciones altas, lo que reduce su poder discriminante individual y explica por qué los selectores priorizan variables de ubicación y capacidad sobre los scores de reseñas.
+
+---
+
+# Fundamentos Matemáticos de SVR {#sec-fundamentos}
+
+## Del clasificador al regresor
+
+$$f(\mathbf{x}) = \mathbf{w}^\top \phi(\mathbf{x}) + b$$
+
+## Tubo $\varepsilon$-insensible
+
+$$L_\varepsilon(y, f(\mathbf{x})) = \max(0,\, |y - f(\mathbf{x})| - \varepsilon)$$
+
+## Problema primal
+
+$$\min_{\mathbf{w}, b, \xi, \xi^*} \;\frac{1}{2}\|\mathbf{w}\|^2 + C\sum_{i=1}^n (\xi_i + \xi_i^*)$$
+
+$$\text{s.a.} \quad y_i - f(\mathbf{x}_i) \leq \varepsilon + \xi_i, \quad f(\mathbf{x}_i) - y_i \leq \varepsilon + \xi_i^*, \quad \xi_i, \xi_i^* \geq 0$$
+
+## Formulación dual y kernel RBF
+
+$$f(\mathbf{x}) = \sum_{i \in \mathcal{SV}} (\alpha_i - \alpha_i^*)\, K(\mathbf{x}_i, \mathbf{x}) + b$$
+
+$$K(\mathbf{x}_i, \mathbf{x}_j) = \exp\!\left(-\gamma \|\mathbf{x}_i - \mathbf{x}_j\|^2\right)$$
+
+## Métricas de evaluación
+
+$$\text{RMSE} = \sqrt{\frac{1}{n}\sum_{i=1}^n(y_i-\hat{y}_i)^2} \qquad \text{MAE} = \frac{1}{n}\sum_{i=1}^n|y_i-\hat{y}_i| \qquad R^2 = 1 - \frac{\text{SS}_{res}}{\text{SS}_{tot}}$$
+
+---
+
+# Selección de Características — Estrategia Comparativa {#sec-seleccion}
+
+## Marco conceptual
+
+**k_comun:** fuerza la misma dimensionalidad en todos los selectores para una
+comparativa justa. Se calcula como `max(round(mean(c(k_fisher, k_enet, k_rf))), 4L)`,
+promediando los k naturales de los tres selectores que poseen criterio propio para
+determinarlo (Fisher J, Elastic Net, Random Forest), con un piso de 4 que garantiza
+dimensionalidad suficiente para que el SVR RBF explote combinaciones no lineales.
+
+Este enfoque de consenso evita que un único selector imponga su dimensionalidad:
+Fisher J opera de forma univariada, Elastic Net captura señal lineal penalizada, y
+Random Forest evalúa variables de forma multivariada mediante permutación out-of-bag.
+El promedio de sus k naturales refleja un acuerdo entre criterios de distinta naturaleza.
+Los tres selectores restantes (B&B, XGBoost, SFS-SVR) reciben k_comun directamente.
+
+| # | Selector | Tipo | Criterio interno | k natural |
+|---|---|---|---|---|
+| **S1** | Fisher J | Filter — ranking univariado | $J_F$ sobre grupos extremos Q1 vs Q4 | ✔ umbral μ+0.5σ |
+| **S2** | Elastic Net | Embedded — L1+L2 | $\ell_1 + \ell_2$ penalizada | ✔ coeficientes ≠ 0 bajo $\lambda_{min}^{CV}$ |
+| **S3** | Branch & Bound | Filter — exhaustivo | Fisher multivariado $J(\mathcal{S})$ | — recibe k_comun |
+| **S4** | XGBoost (Gain) | Embedded — no lineal | Gain por nodo normalizado | — recibe k_comun |
+| **S5** | Random Forest (%IncMSE) | Embedded — no lineal | %IncMSE bagging | ✔ umbral μ+0.5σ |
+| **S6** | SFS wrapper-SVR | Wrapper — greedy | Fisher multivariado incremental | — recibe k_comun |
+
+Todos compiten con el **mismo k_comun, mismo SVR evaluador (C=5, γ=0.05, ε=0.1) y
+misma validación cruzada CV-5 sobre Train**. Test permanece completamente reservado
+para la evaluación final del modelo en la sección de Modelamiento.
+
+:::{.callout-note}
+**Principio de no contaminación:** toda la comparativa entre selectores se basa en
+métricas de validación cruzada CV-5 sobre Train. El conjunto Test permanece sellado
+hasta la sección de Modelamiento. Esto garantiza que la elección del selector
+ganador no esté influenciada por los datos de evaluación final.
+:::
+
+## Definiciones formales de los selectores {#sec-definiciones}
+
+### [S1] Fisher J Univariado
+
+Mide la separabilidad entre los grupos extremos de la variable objetivo (Q1 vs Q4):
+
+$$\boxed{J_F(x_j) = \frac{(\mu_{Q1}^{(j)} - \mu_{Q4}^{(j)})^2}{\sigma_{Q1}^{2(j)} + \sigma_{Q4}^{2(j)}}}$$
+
+### [S2] Elastic Net
+
+Regresión penalizada con combinación convexa de normas $\ell_1$ y $\ell_2$:
+
+$$\boxed{\hat{\beta} = \arg\min_\beta \left\{ \frac{1}{2n}\|\mathbf{y} - \mathbf{X}\beta\|^2 + \lambda\left[\alpha\|\beta\|_1 + \frac{1-\alpha}{2}\|\beta\|_2^2\right] \right\}}$$
+
+$\alpha = 0.5$ equilibra selección ($\ell_1$) y estabilidad ante multicolinealidad ($\ell_2$). Las features seleccionadas son aquellas con $\hat{\beta}_j \neq 0$ bajo $\lambda_{\min}^{CV}$.
+
+### [S3] Branch & Bound — Fisher Multivariado
+
+$$\boxed{J(\mathcal{S}) = \text{tr}(C_w^{-1}\, C_b)}$$
+
+$$C_w = \sum_{k=1}^{K} P_k C_k \qquad C_b = \sum_{k=1}^{K} P_k(\bar{z}_k - \bar{z})(\bar{z}_k - \bar{z})^\top$$
+
+La poda se activa cuando la cota superior del subárbol no supera el mejor $J^*$ encontrado: $\text{bound}(\mathcal{S}) \leq J^* \Rightarrow$ podar.
+
+### [S4] XGBoost — Gain
+
+$$\boxed{\text{Gain}(x_j) = \frac{1}{|\mathcal{T}|} \sum_{t \in \mathcal{T}} \sum_{\text{nodo} \ni x_j} \Delta \text{Impureza}_{t,j}}$$
+
+Captura relaciones no lineales e interacciones sin asumir estructura funcional. Superior a Fisher J porque evalúa la contribución de cada variable en el contexto del ensemble.
+
+### [S5] Random Forest — %IncMSE
+
+$$\boxed{\text{Imp}(x_j) = \frac{1}{B}\sum_{b=1}^{B}\left(\text{MSE}_b^{\text{perm}(j)} - \text{MSE}_b\right)}$$
+
+Importancia por permutación: mide el incremento en MSE al permutar aleatoriamente la feature $x_j$ en los árboles out-of-bag. Estable por el promedio sobre $B$ árboles. Es uno de los tres selectores de referencia para k_comun por su evaluación multivariada.
+
+### [S6] SFS wrapper-SVR — Sequential Forward Selection
+
+$$\boxed{
+\mathcal{F}_{k+1} = \mathcal{F}_k \cup \left\{\arg\max_{x_j \notin \mathcal{F}_k} J(\mathcal{F}_k \cup \{x_j\})\right\}
+}$$
+
+SFS construye $\mathcal{F}$ añadiendo una variable a la vez, usando Fisher multivariado incremental como criterio interno. Parte de $\mathcal{F}_1 = \{\text{mejor variable individual por Fisher J}\}$ y repite hasta $|\mathcal{F}| = k^*$. Una variable incluida no puede ser removida: susceptible a mínimos locales pero con costo fijo $O(k^{*2})$. El rendimiento final se mide con el mismo SVR-CV5 que los demás selectores.
+
+## Score de selección — Selector Ganador
+
+$$\boxed{\Psi_s = \frac{1}{2}\left(1 - \frac{\text{RMSE}_s^{CV} - \min_s \text{RMSE}^{CV}}{\max_s \text{RMSE}^{CV} - \min_s \text{RMSE}^{CV}}\right) + \frac{1}{2}\cdot R^{2,CV}_s}$$
+
+$$s^* = \arg\max_{s \in \{S1,\ldots,S6\}} \Psi_s$$
+
+$\Psi \in [0,1]$: penaliza RMSE alto y premia $R^2$ alto simultáneamente. Ambas métricas provienen de CV-5 sobre Train exclusivamente — Test no interviene en la selección del ganador.
+
+## Features de entrada a los selectores
+
+```{r fs-input-summary}
+cat(sprintf("Features que entran a los 6 selectores: %d\n%s",
+            ncol(X_tr_norm),
+            paste(names(X_tr_norm), collapse=" | ")))
+```
+
+## Setup común 
+
+El **setup común** define los ingredientes compartidos que todos los selectores usan sin excepción:
+
+- **`all_cols`:** features limpias y normalizadas que entran a competir.
+- **`idx_low` / `idx_high`:** índices Q1 y Q4 de la variable objetivo.
+- **`fisher_reg()`:** calcula $J_F$ univariado sobre grupos extremos Q1 vs Q4.
+- **`fisher_ind`:** vector con $J_F$ de cada feature, ordenado descendentemente.
+- **`eval_svr_cv()`:** función evaluadora común. Entrena un SVR (C=5, γ=0.05, ε=0.1) mediante **CV-5 exclusivamente sobre Train** y retorna RMSE y $R^2$ promediados sobre los 5 folds. Test no interviene en esta etapa. Todos los selectores son juzgados por el mismo árbitro.
+
+```{r fs-setup}
+all_cols <- names(X_tr_norm)
+
+q1_y    <- quantile(y_tr, 0.25); q3_y <- quantile(y_tr, 0.75)
+idx_low <- which(y_tr <= q1_y);  idx_high <- which(y_tr >= q3_y)
+
+fisher_reg <- function(x) {
+  g1 <- x[idx_low]; g2 <- x[idx_high]
+  if (var(g1)+var(g2) == 0) return(0)
+  (mean(g1)-mean(g2))^2 / (var(g1)+var(g2))
+}
+fisher_ind <- setNames(map_dbl(all_cols, ~ fisher_reg(X_tr_norm[[.x]])), all_cols)
+
+# Evaluador honesto: CV-5 sobre Train únicamente.
+# Test queda completamente fuera; reservado para la sección de Modelamiento.
+ctrl_fs <- trainControl(
+  method          = "cv",
+  number          = 5,
+  savePredictions = "final",
+  verboseIter     = FALSE
+)
+
+eval_svr_cv <- function(vars, label) {
+  df_tr   <- as.data.frame(X_tr_norm[, vars, drop = FALSE])
+  df_tr$y <- y_tr
+
+  set.seed(42)
+  m_cv <- suppressWarnings(
+    train(
+      y ~ .,
+      data      = df_tr,
+      method    = "svmRadial",
+      trControl = ctrl_fs,
+      tuneGrid  = data.frame(C = 5, sigma = 0.05),
+      metric    = "RMSE"
+    )
+  )
+
+  tibble(
+    Selector = label,
+    k        = length(vars),
+    RMSE_cv  = round(min(m_cv$results$RMSE), 4),
+    R2_cv    = round(max(m_cv$results$Rsquared, na.rm = TRUE), 4),
+    features = paste(vars, collapse = " | ")
+  )
+}
+```
+
+## Paso 1: k natural de cada selector base
+
+### k natural Fisher J
+
+```{r k-fisher}
+fisher_df     <- tibble(variable=all_cols, fisher_J=fisher_ind[all_cols]) |> arrange(desc(fisher_J))
+umbral_fisher <- mean(fisher_df$fisher_J) + 0.5*sd(fisher_df$fisher_J)
+k_fisher      <- sum(fisher_df$fisher_J >= umbral_fisher)
+
+cat(sprintf("Fisher J — umbral: %.4f | k natural: %d\n", umbral_fisher, k_fisher))
+```
+
+Con un umbral de $0.1794$ —valor que corresponde a $\mu + 0.5\sigma$ de la distribución de scores $J_F$ sobre todas las features— y un $k$ natural igual a 9, Fisher J identificó 9 features cuyo poder discriminante supera en media desviación estándar la media del conjunto, es decir, features que separan de forma estadísticamente relevante los grupos extremos de precio (Q1 vs Q4).
+
+### k natural Elastic Net
+
+```{r k-enet}
+enet_cv <- cv.glmnet(as.matrix(X_tr_norm), y_tr, alpha=0.5, nfolds=5)
+coef_en <- coef(enet_cv, s="lambda.min")[-1, 1]
+k_enet  <- sum(coef_en != 0)
+
+cat(sprintf("Elastic Net — lambda.min: %.5f | k natural: %d\n", enet_cv$lambda.min, k_enet))
+```
+Un $\lambda_{min} = 0.00301$ es un valor de penalización bajo, lo que indica que el modelo no requirió regularización intensa para estabilizarse sobre estos datos: las features presentan señal suficiente para que Elastic Net converja sin necesidad de penalizar agresivamente los coeficientes. Respecto al $k$ natural de 49, es un valor alto que refleja que bajo esta penalización laxa el modelo considera informativas una proporción amplia de las features disponibles, sugiriendo que la señal predictiva está distribuida entre muchas variables y no concentrada en unas pocas.
+
+### k natural Random Forest
+
+```{r k-rf}
+
+set.seed(42)
+rf_model  <- randomForest(x=X_tr_norm, y=y_tr, ntree=300, importance=TRUE)
+imp_rf    <- importance(rf_model, type=1)
+imp_df    <- tibble(variable=rownames(imp_rf), imp=imp_rf[,1]) |> arrange(desc(imp))
+umbral_rf <- mean(imp_df$imp) + 0.5*sd(imp_df$imp)
+k_rf      <- sum(imp_df$imp >= umbral_rf)
+
+cat(sprintf("RF — umbral %%IncMSE: %.4f | k natural: %d\n", umbral_rf, k_rf))
+```
+
+Un umbral de $24.5989\%$ en $\%IncMSE$ indica que solo las features cuya permutación incrementa el error del modelo en al menos un 24.6% son consideradas relevantes, un criterio exigente que refleja alta selectividad. Bajo este umbral, Random Forest retuvo 11 features como $k$ natural, valor moderado que indica que la señal predictiva está concentrada en un subconjunto acotado de variables con contribución individual sustantiva al poder predictivo del ensemble.
+
+### k común $k^*$
+
+```{r k-comun}
+k_comun <- max(round(mean(c(k_fisher, k_enet, k_rf))), 4L)
+cat(sprintf("Fisher: %d | Elastic Net: %d | RF: %d | k* común: %d\n", k_fisher, k_enet, k_rf, k_comun))
+```
+
+:::{.callout-note}
+**$k^* =$ `r k_comun`** calculado como `max(round(mean(k_Fisher, k_ElasticNet, k_RF)), 4L)`.
+Ningún selector impone su dimensionalidad: el promedio de los tres k naturales refleja
+un consenso entre criterios de distinta naturaleza (univariado, lineal penalizado,
+no lineal por permutación). El piso de 4 garantiza dimensionalidad suficiente para
+que el SVR RBF explote combinaciones no lineales más allá de variables dominantes individuales.
+
+La comparativa sigue siendo justa: todos los selectores compiten con el mismo k_comun,
+mismo SVR evaluador y misma validación cruzada CV-5 sobre Train.
+:::
+
+---
+
+## Paso 2: Selección con $k^*$ features
+
+### [S1] Fisher J
+
+```{r sel-fisher}
+vars_fisher <- fisher_df |> slice_head(n=k_comun) |> pull(variable)
+
+ggplot(fisher_df, aes(x=reorder(variable,fisher_J), y=fisher_J, fill=fisher_J)) +
+  geom_col(width=0.7, color="white") +
+  geom_hline(yintercept=fisher_df$fisher_J[k_comun], linetype="dashed", color="#e74c3c", linewidth=0.8) +
+  geom_text(aes(label=round(fisher_J,3)), hjust=-0.1, size=2.8) +
+  scale_fill_gradient(low="#85c1e9", high="#1a5276", guide="none") +
+  coord_flip() + scale_y_continuous(expand=expansion(mult=c(0,0.2))) +
+  labs(title=sprintf("[S1] Fisher J — top %d features", k_comun),
+       subtitle="Línea roja: corte k*", x=NULL, y=expression(J[F]))
+
+# Evalúa con SVR-CV5 las features seleccionadas por Fisher J y guarda RMSE y R² para la comparativa final
+res_fisher <- eval_svr_cv(vars_fisher, "S1 — Fisher J")
+```
+
+- **$J_F$:** razón entre separación cuadrática de medias inter-grupo (Q1 vs Q4) y suma de varianzas intra-grupo. Mayor $J_F$ = mayor poder discriminante univariado respecto al precio.
+- La **línea roja punteada** marca el corte `k_comun`.
+
+### [S2] Elastic Net
+
+```{r sel-enet}
+vars_enet <- names(coef_en[coef_en != 0])
+if (length(vars_enet) > k_comun)
+  vars_enet <- names(sort(abs(coef_en[vars_enet]), decreasing=TRUE))[1:k_comun]
+if (length(vars_enet) < k_comun) {
+  extras    <- setdiff(vars_fisher, vars_enet)
+  vars_enet <- c(vars_enet, extras[1:(k_comun - length(vars_enet))])
+}
+
+tibble(variable=vars_enet, coef=round(coef_en[vars_enet], 4)) |>
+  arrange(desc(abs(coef))) |>
+  kbl(caption=sprintf("[S2] Elastic Net — %d features seleccionadas", k_comun),
+      col.names=c("Variable","Coeficiente")) |>
+  kable_styling(bootstrap_options=c("striped","hover","condensed"), full_width=FALSE, font_size=11)
+
+# Evalúa con SVR-CV5 las features seleccionadas por Elastic Net y guarda RMSE y R² para la comparativa final
+res_enet <- eval_svr_cv(vars_enet, "S2 — Elastic Net")
+```
+
+Elastic Net seleccionó 23 features con coeficiente $\hat{\beta}_j \neq 0$, lo que confirma que bajo $\lambda_{min} = 0.00301$ el modelo penalizado retiene señal distribuida en múltiples variables. Los coeficientes más altos en valor absoluto corresponden a `accommodates` (2.045), `bathrooms_num` (1.164) y `beds` (-1.158), variables de capacidad física que dominan la señal lineal del precio. Las dummies de `neighbourhood_cleansed` —Lo Barnechea, Vitacura, Las Condes y Providencia— aparecen con coeficientes positivos moderados, coherente con su rol como indicadores de ubicación premium. Los coeficientes negativos de `beds` y `minimum_nights` reflejan que, controlando por las demás variables, más camas o restricciones de estadía mínima se asocian a precios relativamente menores en escala log1p.
+
+Esto es directamente coherente con la descripción metodológica: el valor absoluto del coeficiente mide la magnitud de la contribución lineal penalizada de cada feature, y la componente $\ell_2$ de Elastic Net estabiliza precisamente las estimaciones de las dummies de `neighbourhood_cleansed`, que presentan correlación entre sí por su naturaleza de codificación OHE sobre una misma variable categórica.
+
+### [S3] Branch & Bound
+
+```{r sel-bb}
+
+pool_bb       <- fisher_df$variable[1:min(2L*k_comun, length(all_cols))]
+fi_pool       <- fisher_ind[pool_bb]
+
+fisher_multi  <- function(vars) {
+  X_sub <- as.matrix(X_tr_norm[c(idx_low,idx_high), vars, drop=FALSE])
+  y_bin <- c(rep(0L,length(idx_low)), rep(1L,length(idx_high)))
+  g1 <- X_sub[y_bin==0L,,drop=FALSE]; g2 <- X_sub[y_bin==1L,,drop=FALSE]
+  m1 <- colMeans(g1); m2 <- colMeans(g2)
+  Sw <- (cov(g1)*(nrow(g1)-1L) + cov(g2)*(nrow(g2)-1L)) / (nrow(g1)+nrow(g2)-2L)
+  dm <- matrix(m1-m2, ncol=1L)
+  tryCatch(as.numeric(t(dm) %*% solve(Sw+diag(1e-8,ncol(Sw))) %*% dm),
+           error=function(e) sum((m1-m2)^2/(diag(Sw)+1e-8)))
+}
+
+best_score_bb <- 0; best_subset <- pool_bb[order(fi_pool,decreasing=TRUE)][1:k_comun]
+best_score_bb <- fisher_multi(best_subset); if (!is.finite(best_score_bb)) best_score_bb <- 0
+nodes_visited <- 0L; MAX_NODES <- 50000L
+
+bb_search <- function(sel_idx, rem_idx, depth) {
+  if (nodes_visited >= MAX_NODES) return(invisible(NULL))
+  if (depth == k_comun) {
+    nodes_visited <<- nodes_visited + 1L
+    sc <- fisher_multi(pool_bb[sel_idx])
+    if (is.finite(sc) && sc > best_score_bb) { best_score_bb <<- sc; best_subset <<- pool_bb[sel_idx] }
+    return(invisible(NULL))
+  }
+  for (i in seq_along(rem_idx)) {
+    nodes_visited <<- nodes_visited + 1L
+    if (nodes_visited >= MAX_NODES) return(invisible(NULL))
+    ri <- rem_idx[i]; rest <- rem_idx[-seq_len(i)]
+    needed <- k_comun - depth - 1L
+    bound  <- fi_pool[ri] + sum(head(sort(fi_pool[rest],decreasing=TRUE), needed))
+    if (bound <= best_score_bb) next
+    bb_search(c(sel_idx,ri), rest, depth+1L)
+  }
+}
+bb_search(integer(0), seq_along(pool_bb), 0L)
+vars_bb <- best_subset
+
+cat(sprintf("[S3] B&B — k=%d | Nodos: %d | Fisher multi: %.4f\n  %s\n",
+            k_comun, nodes_visited, best_score_bb, paste(vars_bb,collapse=", ")))
+
+# Evalúa con SVR-CV5 las features seleccionadas por Branch & Bound y guarda RMSE y R² para la comparativa final
+res_bb <- eval_svr_cv(vars_bb, "S3 — Branch & Bound")
+```
+
+B&B seleccionó $k=23$ features evaluando 46 nodos, con un Fisher multivariado $J(\mathcal{S}) = 6.687$ sobre el subconjunto óptimo. El número de nodos explorados es reducido gracias a la poda agresiva del algoritmo: cuando la cota superior Fisher univariada de un subárbol no supera el mejor $J(\mathcal{S})$ encontrado hasta ese momento, la rama se descarta sin explorarla, lo que explica que con 46 nodos se alcance un óptimo sobre un espacio combinatorio potencialmente mucho mayor. El valor $J(\mathcal{S}) = 6.687$ mide la separabilidad conjunta del subconjunto seleccionado en el espacio multivariado Q1 vs Q4, siendo superior a cualquier $J_F$ univariado individual precisamente porque captura la contribución combinada de las 23 variables seleccionadas.
+
+### [S4] XGBoost — Gain
+
+```{r sel-xgb}
+dtrain  <- xgb.DMatrix(data=as.matrix(X_tr_norm), label=y_tr)
+params  <- list(objective="reg:squarederror", max_depth=6,
+                eta=0.1, subsample=0.8, colsample_bytree=0.8, nthread=1)
+xgb_mod <- xgb.train(params=params, data=dtrain, nrounds=200, verbose=0)
+imp_xgb  <- xgb.importance(model=xgb_mod, feature_names=colnames(X_tr_norm)) |> as_tibble()
+vars_xgb <- imp_xgb |> slice_head(n=k_comun) |> pull(Feature)
+
+ggplot(imp_xgb |> slice_head(n=k_comun),
+       aes(x=reorder(Feature,Gain), y=Gain, fill=Gain)) +
+  geom_col(width=0.7, color="white") +
+  geom_text(aes(label=round(Gain,4)), hjust=-0.1, size=2.8) +
+  scale_fill_gradient(low="#f9e79f", high="#d35400", guide="none") +
+  coord_flip() + scale_y_continuous(expand=expansion(mult=c(0,0.2))) +
+  labs(title=sprintf("[S4] XGBoost — top %d features (Gain)", k_comun),
+       subtitle="Línea roja: corte k*", x=NULL, y="Gain") +
+  geom_hline(yintercept=imp_xgb$Gain[k_comun], linetype="dashed", color="#e74c3c", linewidth=0.8)
+
+# Evalúa con SVR-CV5 las features seleccionadas por XGBoost y guarda RMSE y R² para la comparativa final
+res_xgb <- eval_svr_cv(vars_xgb, "S4 — XGBoost (Gain)")
+```
+
+XGBoost aporta una perspectiva que ningún otro selector captura con igual claridad: la dominancia absoluta de `accommodates` con un Gain de $0.327$ —más del doble que la segunda variable— revela que la capacidad del alojamiento es el predictor no lineal más importante del precio, concentrando más de un tercio de la reducción de impureza total del ensemble. Esta jerarquía pronunciada no es visible en Fisher J ni en Elastic Net, donde la señal aparece más distribuida entre variables. El **Gain** mide precisamente esto: la reducción promedio de impureza que aporta cada variable en los nodos donde es utilizada, normalizada sobre todos los árboles del ensemble, lo que lo convierte en una medida de importancia multivariada no lineal directamente interpretable.
+
+### [S5] Random Forest — %IncMSE
+
+```{r sel-rf}
+vars_rf <- imp_df |> slice_head(n=k_comun) |> pull(variable)
+
+ggplot(imp_df |> slice_head(n=k_comun),
+       aes(x=reorder(variable,imp), y=imp, fill=imp)) +
+  geom_col(width=0.7, color="white") +
+  geom_hline(yintercept=imp_df$imp[k_comun], linetype="dashed", color="#e74c3c", linewidth=0.8) +
+  geom_text(aes(label=round(imp,3)), hjust=-0.1, size=2.8) +
+  scale_fill_gradient(low="#f9e79f", high="#27ae60", guide="none") +
+  coord_flip() + scale_y_continuous(expand=expansion(mult=c(0,0.2))) +
+  labs(title=sprintf("[S5] Random Forest — top %d features (%%IncMSE)", k_comun),
+       subtitle="Línea roja: corte k*", x=NULL, y="%IncMSE")
+
+# Evalúa con SVR-CV5 las features seleccionadas por Random Forest y guarda RMSE y R² para la comparativa final
+res_rf <- eval_svr_cv(vars_rf, "S5 — Random Forest")
+```
+
+- **%IncMSE:** caída porcentual promedio en MSE al permutar una variable en los árboles out-of-bag. Mayor caída = variable más importante.
+
+### [S6] SFS wrapper-SVR — Sequential Forward Selection
+
+```{r sel-sfs}
+pool_sfs <- fisher_df$variable[1:min(2 * k_comun, length(all_cols))]
+
+fisher_multi_inc <- function(vars) {
+  X_sub <- as.matrix(X_tr_norm[c(idx_low, idx_high), vars, drop = FALSE])
+  g1 <- X_sub[seq_along(idx_low),  , drop = FALSE]
+  g2 <- X_sub[-seq_along(idx_low), , drop = FALSE]
+  m1 <- colMeans(g1); m2 <- colMeans(g2)
+  Sw <- (cov(g1) * (nrow(g1) - 1) + cov(g2) * (nrow(g2) - 1)) /
+        (nrow(g1) + nrow(g2) - 2)
+  dm <- matrix(m1 - m2, ncol = 1)
+  tryCatch(
+    as.numeric(t(dm) %*% solve(Sw + diag(1e-8, ncol(Sw))) %*% dm),
+    error = function(e) sum((m1 - m2)^2 / (diag(Sw) + 1e-8))
+  )
+}
+
+sel_sfs <- fisher_df$variable[1]
+rem_sfs <- setdiff(pool_sfs, sel_sfs)
+
+for (step in 2:k_comun) {
+  scores_fwd <- map_dbl(rem_sfs, ~ fisher_multi_inc(c(sel_sfs, .x)))
+  best_fwd   <- rem_sfs[which.max(scores_fwd)]
+  sel_sfs    <- c(sel_sfs, best_fwd)
+  rem_sfs    <- setdiff(rem_sfs, best_fwd)
+}
+
+vars_sfs <- sel_sfs
+
+# Evalúa con SVR-CV5 las features seleccionadas por SFS-SVR y guarda RMSE y R² para la comparativa final
+res_sfs  <- eval_svr_cv(vars_sfs, "S6 — SFS-SVR")
+
+cat(sprintf("[S6] SFS-SVR — k=%d | RMSE CV: %.4f | R² CV: %.4f\n  Features: %s\n",
+            res_sfs$k, res_sfs$RMSE_cv, res_sfs$R2_cv,
+            paste(vars_sfs, collapse = ", ")))
+```
+
+SFS-SVR seleccionó $k=23$ features mediante adición secuencial greedy usando Fisher multivariado incremental $J(\mathcal{F}_k \cup \{x_j\})$ como criterio interno —maximizando la separabilidad conjunta Q1 vs Q4 en cada paso— y obtuvo un RMSE CV de $0.3659$ y un $R^2$ CV de $0.6821$ sobre validación cruzada de 5 folds exclusivamente en Train. El $R^2 = 0.6821$ indica que el subconjunto seleccionado explica el 68.2% de la varianza del precio en escala log1p, mientras que el RMSE de $0.3659$ refleja el error promedio de predicción en esa misma escala.
+
+
+---
+
+## Paso 3 — Score Argmax Ψ y selección del ganador
+
+:::{.callout-important}
+**Principio de no contaminación:** toda la comparativa se basa en CV-5 sobre Train. Test permanece sellado hasta la sección de Modelamiento.
+:::
+
+```{r fs-score-ganador, fig.height=4}
+comparativa <- bind_rows(res_fisher, res_enet, res_bb, res_xgb, res_rf, res_sfs)
+
+rmse_min <- min(comparativa$RMSE_cv); rmse_max <- max(comparativa$RMSE_cv)
+comparativa <- comparativa |>
+  mutate(
+    Psi = 0.5 * (1 - (RMSE_cv - rmse_min) / (rmse_max - rmse_min + 1e-10)) + 0.5 * R2_cv
+  ) |>
+  arrange(desc(Psi))
+
+comparativa |>
+  select(Selector, k, RMSE_cv, R2_cv, Psi) |>
+  kbl(caption = sprintf(
+        "Comparativa — k*=%d | Ψ = 0.5·(1−RMSE_norm^CV) + 0.5·R²^CV | CV-5 sobre Train",
+        k_comun),
+      col.names = c("Selector", "k", "RMSE CV-5", "R² CV-5", "Ψ Score"),
+      digits = 4) |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE, font_size = 12) |>
+  row_spec(1, bold = TRUE, background = "#d5f5e3")
+
+p_psi <- ggplot(comparativa, aes(x=reorder(Selector, Psi), y=Psi, fill=Selector)) +
+  geom_col(width=0.6, show.legend=FALSE) +
+  geom_text(aes(label=round(Psi,4)), hjust=-0.1, size=4) +
+  coord_flip() + scale_fill_brewer(palette="Set2") +
+  scale_y_continuous(expand=expansion(mult=c(0,0.2))) +
+  labs(title="Score Ψ por selector (CV-5 sobre Train)",
+       subtitle="Mayor es mejor (RMSE↓ + R²↑)",
+       x=NULL, y=expression(Psi))
+
+p_rmse <- ggplot(comparativa, aes(x=reorder(Selector,-RMSE_cv), y=RMSE_cv, fill=Selector)) +
+  geom_col(width=0.6, show.legend=FALSE) +
+  geom_text(aes(label=round(RMSE_cv,4)), hjust=-0.1, size=3.5) +
+  coord_flip() + scale_fill_brewer(palette="Set2") +
+  scale_y_continuous(expand=expansion(mult=c(0,0.2))) +
+  labs(title="RMSE CV-5 por selector (Train)", x=NULL, y="RMSE (log1p)")
+
+grid.arrange(p_psi, p_rmse, ncol=2)
+```
+
+```{r fs-ganador}
+
+todos_vars  <- list(vars_fisher, vars_enet, vars_bb, vars_xgb, vars_rf, vars_sfs)
+nombres_sel <- c("S1 — Fisher J","S2 — Elastic Net","S3 — Branch & Bound",
+                 "S4 — XGBoost (Gain)","S5 — Random Forest","S6 — SFS-SVR")
+
+ganador     <- comparativa$Selector[1]
+idx_ganador <- match(ganador, nombres_sel)
+vars_sel    <- todos_vars[[idx_ganador]]
+
+cat(sprintf("\n✔ Selector ganador: %s\n  k=%d | Ψ=%.4f | RMSE CV-5: %.4f | R² CV-5: %.4f\n  Features: %s\n",
+            ganador, k_comun, comparativa$Psi[1], comparativa$RMSE_cv[1], comparativa$R2_cv[1],
+            paste(vars_sel, collapse=", ")))
+```
+
+Las 23 features seleccionadas por XGBoost pueden agruparse en cuatro dimensiones que el SVR RBF explota de forma conjunta y no lineal.
+
+**Capacidad física del alojamiento.** Las variables `accommodates` (capacidad de huéspedes), `bedrooms` (dormitorios), `beds` (camas), `bathrooms_num` (baños) y `room_typePrivate room` (habitación privada) definen la dimensión de oferta tangible. En el SVR RBF, estas variables interactúan mediante el kernel gaussiano: un alojamiento que combina alta capacidad con múltiples dormitorios y baños genera un vector de features que se sitúa en una región del espacio donde los vectores de soporte asignan precios sistemáticamente más altos, capturando la no linealidad entre tamaño y precio que un modelo lineal no puede representar.
+
+**Ubicación geográfica.** Las dummies `neighbourhood_cleansedSantiago`, `neighbourhood_cleansedLas Condes`, `neighbourhood_cleansedLo Barnechea`, `neighbourhood_cleansedProvidencia` y `neighbourhood_cleansedVitacura` codifican la pertenencia comunal. En el espacio transformado por el kernel RBF, estas variables funcionan como separadores de regiones de precio: alojamientos en Las Condes o Lo Barnechea se agrupan cerca de vectores de soporte de precio alto, mientras que los de Santiago centro se agrupan en una región de alta dispersión, coherente con su $J_F$ más elevado.
+
+**Política de disponibilidad y estadía mínima.** `availability_365` (días disponibles al año), `availability_30` (días disponibles en 30 días), `minimum_nights` (noches mínimas), `minimum_nights_avg_ntm` (promedio estadía mínima) y `maximum_nights` (noches máximas) capturan la estrategia operativa del anfitrión. Restricciones de estadía mínima elevadas se asocian típicamente a alojamientos orientados a estadías largas con precios distintos, y la disponibilidad anual refleja si el alojamiento opera como negocio principal o complementario, señal que el SVR incorpora como parte de la estructura de precios.
+
+**Reputación, demanda y perfil del anfitrión.** `review_scores_location` (score de ubicación), `reviews_per_month` (frecuencia de reseñas), `number_of_reviews_ltm` (reseñas últimos 12 meses), `number_of_reviews_l30d` (reseñas últimos 30 días), `host_acceptance_rate` (tasa de aceptación), `calculated_host_listings_count_entire_homes` (propiedades completas del anfitrión), `calculated_host_listings_count_private_rooms` (habitaciones privadas del anfitrión) y `property_typeOtro` (tipo de propiedad residual) capturan la señal de demanda y profesionalización del anfitrión. Un anfitrión con alta tasa de aceptación, múltiples propiedades completas y score de ubicación elevado ocupa una región del espacio de features que el SVR asocia a precios superiores, reflejando que la reputación y escala del operador son determinantes del precio más allá de las características físicas del inmueble.
+
+:::{.callout-tip}
+El selector ganador es **S4 — XGBoost (Gain)** con $k^*=23$ features, un score $\Psi = 0.8496$, RMSE CV-5 de $0.3562$ y $R^2$ CV-5 de $0.6992$. El $\Psi = 0.8496$ sobre escala $[0,1]$ refleja el mejor equilibrio simultáneo entre error bajo y varianza explicada alta entre los seis selectores evaluados, garantizando comparativa justa al penalizar RMSE alto y premiar $R^2$ alto usando exclusivamente métricas CV-5 sobre Train. El $R^2 = 0.6992$ indica que el subconjunto seleccionado explica el 69.9% de la varianza del precio en escala log1p, mientras que el RMSE de $0.3562$ es el más bajo de la comparativa. Este resultado es coherente con la naturaleza del problema: XGBoost captura relaciones no lineales e interacciones entre variables que los selectores lineales como Fisher J o Elastic Net no detectan, produciendo un subconjunto con mayor poder predictivo real medido por el evaluador SVR-CV5 común a todos los selectores. Las features del selector ganador entran al SVR final con tuning, donde Test se usa por primera vez.
+:::
+
+## Grafo de relevancia — selector ganador
+
+```{r grafo, fig.width=18, fig.height=14}
+acronimos <- c(
+  "accommodates"                                    = "ACC",
+  "bedrooms"                                        = "BED",
+  "bathrooms_num"                                   = "BAT",
+  "beds"                                            = "BDS",
+  "minimum_nights"                                  = "MNN",
+  "minimum_nights_avg_ntm"                          = "MNA",
+  "availability_365"                                = "AV3",
+  "availability_30"                                 = "AV1",
+  "review_scores_location"                          = "RSL",
+  "reviews_per_month"                               = "RPM",
+  "number_of_reviews_l30d"                          = "NRL",
+  "number_of_reviews_ltm"                           = "NRT",
+  "number_of_reviews"                               = "NRV",
+  "host_acceptance_rate"                            = "HAR",
+  "calculated_host_listings_count_entire_homes"     = "HLE",
+  "calculated_host_listings_count_private_rooms"    = "HLP",
+  "room_typePrivate room"                           = "RTP",
+  "property_typeOtro"                               = "PTO",
+  "neighbourhood_cleansedLo Barnechea"              = "LBC",
+  "neighbourhood_cleansedSantiago"                  = "STG",
+  "neighbourhood_cleansedLas Condes"                = "LCN",
+  "neighbourhood_cleansedProvidencia"               = "PRV",
+  "neighbourhood_cleansedVitacura"                  = "VIT"
+)
+
+label_nodo <- function(x) {
+  if (x == "log_price") return("log_price")
+  if (x %in% names(acronimos)) return(acronimos[x])
+  substr(x, 1, 3)
+}
+
+edges <- data.frame(from = "log_price", to = vars_sel, weight = fisher_ind[vars_sel])
+g <- graph_from_data_frame(edges, directed = FALSE,
+       vertices = data.frame(name = c("log_price", vars_sel)))
+
+V(g)$color       <- ifelse(V(g)$name == "log_price", "#27ae60", "#6c3483")
+V(g)$size        <- ifelse(V(g)$name == "log_price", 45,
+                            scales::rescale(fisher_ind[vars_sel], to = c(22, 42)))
+V(g)$label       <- sapply(V(g)$name, label_nodo)
+V(g)$label.color <- "white"
+V(g)$label.cex   <- 0.9
+V(g)$label.font  <- 2
+V(g)$frame.color <- NA
+E(g)$width       <- scales::rescale(log1p(edges$weight), to = c(1, 8))
+E(g)$color       <- "#95a5a6"
+
+# Layout circular
+lay <- layout_in_circle(g)
+
+# Plot base sin etiquetas de aristas
+plot(g,
+     layout  = lay,
+     margin  = 0.35,
+     main    = paste0("Grafo de Relevancia — Selector ganador: ", ganador),
+     sub     = "Tamaño nodo: Fisher J  |  Grosor arista: poder discriminante  |  Ver diccionario de acrónimos")
+
+```
+
+**Diccionario de Acrónimos — Grafo de Relevancia**
+
+| Acrónimo | Variable original | $J_F$ |
+|---|---|---|
+| **ACC** | accommodates | 1.005 |
+| **STG** | neighbourhood_cleansed — Santiago | 0.736 |
+| **BDS** | beds | 0.319 |
+| **HLE** | calculated_host_listings_count_entire_homes | 0.427 |
+| **LCN** | neighbourhood_cleansed — Las Condes | 0.260 |
+| **LBC** | neighbourhood_cleansed — Lo Barnechea | 0.252 |
+| **BED** | bedrooms | 0.244 |
+| **BAT** | bathrooms_num | 0.039 |
+| **RSL** | review_scores_location | 0.052 |
+| **RPM** | reviews_per_month | 0.019 |
+| **AV3** | availability_365 | 0.035 |
+| **AV1** | availability_30 | 0.006 |
+| **MNN** | minimum_nights | 0.033 |
+| **HAR** | host_acceptance_rate | 0.001 |
+| **HLP** | calculated_host_listings_count_private_rooms | 0.070 |
+| **MNA** | minimum_nights_avg_ntm | 0.000 |
+| **VIT** | neighbourhood_cleansed — Vitacura | 0.039 |
+| **NRT** | number_of_reviews_ltm | 0.000 |
+| **NRL** | number_of_reviews_l30d | 0.002 |
+| **PTO** | property_type — Otro | 0.002 |
+| **RTP** | room_type — Private room | 0.035 |
+| **PRV** | neighbourhood_cleansed — Providencia | 0.035 |
+| **NRV** | number_of_reviews | — |
+
+---
+
+## Georreferenciación — Comunas seleccionadas por el selector ganador
+```{r georef-comunas-mapa, fig.width=12, fig.height=10}
+
+library(sf)
+library(ggrepel)
+library(chilemapas)
+
+# 1. Shapefile comunas Región Metropolitana
+rm_codigos <- chilemapas::codigos_territoriales |>
+  filter(codigo_region == "13") |>
+  pull(codigo_comuna)
+
+mapa_rm <- chilemapas::mapa_comunas |>
+  filter(codigo_comuna %in% rm_codigos) |>
+  left_join(
+    chilemapas::codigos_territoriales |>
+      select(codigo_comuna, nombre_comuna),
+    by = "codigo_comuna"
+  ) |>
+  mutate(nombre_comuna = stringr::str_to_title(nombre_comuna)) |>
+  st_as_sf()
+
+# 2. Comunas seleccionadas + Fisher J
+fisher_comunas <- tibble(
+  var           = vars_sel[grepl("^neighbourhood_cleansed", vars_sel)],
+  nombre_comuna = sub("^neighbourhood_cleansed", "", var),
+  fisher        = fisher_ind[var]
+)
+
+# 3. Centroides para etiquetas
+centroides <- mapa_rm |>
+  st_transform(32719) |>
+  st_centroid() |>
+  st_transform(4326) |>
+  mutate(
+    lon = st_coordinates(geometry)[, 1],
+    lat = st_coordinates(geometry)[, 2]
+  ) |>
+  st_drop_geometry()
+
+# 4. Enriquecer shapefile
+mapa_plot <- mapa_rm |>
+  left_join(fisher_comunas, by = "nombre_comuna") |>
+  mutate(
+    seleccionada = !is.na(fisher),
+    fisher_fill  = ifelse(seleccionada, fisher, NA_real_)
+  )
+
+etiquetas <- centroides |>
+  left_join(fisher_comunas, by = "nombre_comuna") |>
+  filter(!is.na(fisher))
+
+# 5. Plot
+ggplot() +
+  geom_sf(
+    data      = mapa_plot |> filter(!seleccionada),
+    fill      = "#dce6f0",
+    color     = "#b0bec5",
+    linewidth = 0.25
+  ) +
+  geom_sf(
+    data      = mapa_plot |> filter(seleccionada),
+    aes(fill  = fisher_fill),
+    color     = "white",
+    linewidth = 0.55
+  ) +
+  scale_fill_gradientn(
+    colours  = c("#aed6f1", "#2980b9", "#1a5276"),
+    na.value = "#dce6f0",
+    name     = expression(J[F] ~ "Fisher"),
+    guide    = guide_colorbar(
+      title.position = "top",
+      barwidth       = 12,
+      barheight      = 0.75,
+      title.hjust    = 0.5
+    )
+  ) +
+  geom_label_repel(
+    data          = etiquetas,
+    aes(x = lon, y = lat,
+        label = paste0(nombre_comuna, "\nJ = ", round(fisher, 3))),
+    size          = 3.0,
+    fontface      = "bold",
+    color         = "#1a252f",
+    fill          = "white",
+    alpha         = 0.90,
+    box.padding   = 0.55,
+    point.padding = 0.3,
+    segment.color = "#5d6d7e",
+    segment.size  = 0.4,
+    max.overlaps  = 25
+  ) +
+  geom_point(
+    data   = etiquetas,
+    aes(x = lon, y = lat, size = fisher),
+    shape  = 21,
+    fill   = "white",
+    color  = "#1a5276",
+    stroke = 0.9,
+    alpha  = 0.85
+  ) +
+  scale_size_continuous(range = c(2.5, 7), guide = "none") +
+  labs(
+    title    = paste0("Región Metropolitana — Comunas seleccionadas por ", ganador),
+    subtitle = sprintf(
+      "Polígonos con relleno: dummies neighbourhood_cleansed retenidas en el subconjunto óptimo (k*=%d)  ·  Intensidad: Fisher J discriminante",
+      k_comun
+    ),
+    caption = paste0(
+      "Fuente: Inside Airbnb Santiago (dic. 2024) · Geometrías: {chilemapas} — IDE Chile\n",
+      "Gris: comunas presentes en el dataset pero excluidas por el selector  ·  ",
+      ganador, " seleccionó ", nrow(etiquetas), " comunas"
+    ),
+    x = NULL, y = NULL
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    plot.title   = element_text(face = "bold", size = 14, hjust = 0.5,
+                                color = "#2c3e50",
+                                margin = ggplot2::margin(b = 6)),
+    plot.subtitle = element_text(size = 9.5, hjust = 0.5, color = "#555555",
+                                 margin = ggplot2::margin(b = 10)),
+    plot.caption  = element_text(size = 8, color = "#7f8c8d", hjust = 0.5,
+                                 margin = ggplot2::margin(t = 10)),
+    legend.position = "bottom",
+    legend.title    = element_text(size = 10, face = "bold"),
+    legend.text     = element_text(size = 9),
+    plot.margin     = ggplot2::margin(15, 15, 15, 15)
+  )
+```
+
+El mapa representa sobre la cartografía oficial de la Región Metropolitana únicamente las comunas cuyas variables dummy `neighbourhood_cleansed` fueron incluidas en el subconjunto óptimo del selector ganador. No se trata de una selección geográfica arbitraria: cada polígono coloreado corresponde a una dummy que sobrevivió el proceso completo de Clean Algorithm, normalización MinMax y competencia entre seis selectores bajo el score $\Psi$ con validación CV-5 exclusivamente sobre Train.
+
+La intensidad del relleno de cada polígono es proporcional al Fisher J univariado ($J_F$) de la dummy correspondiente, que mide la capacidad discriminante de esa comuna para separar los grupos extremos de precio (Q1 vs Q4). Santiago centro lidera con $J_F = 0.427$, lo que refleja su alta heterogeneidad interna: concentra simultáneamente alojamientos económicos y premium, generando la mayor dispersión entre quintiles extremos. Las Condes ($J_F = 0.260$) y Lo Barnechea ($J_F = 0.160$) representan el polo premium del eje oriente, con precios consistentemente altos que elevan su separabilidad respecto al quintil inferior. Vitacura y Providencia completan el subconjunto con valores más moderados, coherentes con mercados menos dispersos pero igualmente diferenciados del resto de la región. Los polígonos en gris claro corresponden a comunas presentes en el dataset cuyas dummies no fueron retenidas por el selector, lo que confirma que la selección no es exhaustiva sino discriminada por criterio empírico cuantificado.
+
+El selector no retiene comunas por preferencia nominal, **sino aquellas cuyas dummies aportan poder discriminante real**, medido bajo el mismo evaluador SVR-RBF con CV-5 que rige toda la comparativa entre selectores. El resultado geográfico es interpretable: las cinco comunas seleccionadas son precisamente aquellas donde el precio de un alojamiento Airbnb diverge más sistemáticamente del precio promedio regional, ya sea por concentración de oferta premium o por alta heterogeneidad interna.
+
+---
+
+```{r echo=FALSE}
+
+ggsave("georef_comunas_RM.png", width = 12, height = 10, dpi = 150,
+       bg = "white")
+
+```
+
+
+
+# Modelo SVR con Kernel RBF — Tuning y Evaluación {#sec-modelo}
+
+```{r tuning}
+X_tr_sel <- X_tr_norm[, vars_sel]; X_te_sel <- X_te_norm[, vars_sel]
+
+ctrl     <- trainControl(method="cv", number=5, savePredictions="final")
+grid_svr <- expand.grid(C=c(0.5,1,5,10), sigma=c(0.01,0.05,0.1))
+
+svr_tuned <- train(x=X_tr_sel, y=y_tr, method="svmRadial",
+                   trControl=ctrl, tuneGrid=grid_svr, metric="RMSE")
+
+{cat("Mejor C:    ", svr_tuned$bestTune$C,     "\n")
+cat("Mejor sigma:", svr_tuned$bestTune$sigma, "\n")}
+```
+
+$C = 10$ indica que el modelo aplica penalización alta sobre los errores fuera del tubo $\varepsilon$, priorizando un ajuste preciso sobre los datos de entrenamiento. $\sigma = 0.01$ indica que el kernel RBF tiene decaimiento lento, por lo que cada vector de soporte ejerce influencia sobre un radio amplio del espacio de features. Ambos valores combinados producen un modelo que ajusta con precisión pero generaliza sobre estructuras globales del espacio, apropiado para un problema donde el precio depende de interacciones entre variables de distinta naturaleza —ubicación, capacidad y reputación— que operan a escala amplia.
+
+## Predicciones y métricas
+
+```{r predict}
+pred_tr <- predict(svr_tuned, newdata=X_tr_sel)
+pred_te <- predict(svr_tuned, newdata=X_te_sel)
+
+rmse_fn <- function(r,p) sqrt(mean((r-p)^2))
+mae_fn  <- function(r,p) mean(abs(r-p))
+r2_fn   <- function(r,p) cor(r,p)^2
+
+tibble(
+  Conjunto = c("Train","Test"),
+  RMSE = round(c(rmse_fn(y_tr,pred_tr), rmse_fn(y_te,pred_te)), 4),
+  MAE  = round(c(mae_fn(y_tr,pred_tr),  mae_fn(y_te,pred_te)),  4),
+  R2   = round(c(r2_fn(y_tr,pred_tr),   r2_fn(y_te,pred_te)),   4)
+) |>
+  kbl(caption="Métricas SVR — Train vs Test (escala log1p)") |>
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE, font_size=13) |>
+  row_spec(2, bold=TRUE, background="#eaf2ff")
+```
+<br>
+
+El modelo muestra un desempeño sólido y consistente entre Train y Test. En Train, el RMSE de $0.3251$ y $R^2 = 0.7492$ indican que el modelo explica el 74.9% de la varianza del precio en escala log1p con un error promedio de $0.33$ unidades. En Test, el RMSE sube levemente a $0.3544$ y el $R^2$ cae a $0.7058$, explicando el 70.6% de la varianza sobre datos nunca vistos durante el entrenamiento. La brecha Train–Test es pequeña ($\Delta R^2 = 0.044$, $\Delta$RMSE $= 0.029$), lo que indica ausencia de sobreajuste relevante y buena capacidad de generalización del modelo. El MAE de $0.2413$ en Test refleja que el error absoluto promedio de predicción es de $0.24$ unidades en escala log1p, equivalente a una desviación moderada en escala original de precios CLP.
+
+<br>
+
+## Real vs Predicho y Análisis de Residuos
+
+```{r real-pred, fig.width=12, fig.height=5}
+df_res <- bind_rows(
+  tibble(Real=y_tr, Pred=pred_tr, Residuo=y_tr-pred_tr, Conjunto="Train"),
+  tibble(Real=y_te, Pred=pred_te, Residuo=y_te-pred_te, Conjunto="Test")
+) |> mutate(Conjunto=factor(Conjunto, levels=c("Train","Test")))
+
+p1 <- ggplot(df_res, aes(x=Real, y=Pred, color=Conjunto)) +
+  geom_point(alpha=0.4, size=0.8) +
+  geom_abline(slope=1, intercept=0, color="red", linetype="dashed") +
+  facet_wrap(~Conjunto) +
+  scale_color_manual(values=c("Train"="#2980b9","Test"="#8e44ad"), guide="none") +
+  labs(title="Real vs Predicho — SVR RBF", x="log1p(precio) real", y="log1p(precio) predicho")
+
+p2 <- ggplot(df_res, aes(x=Pred, y=Residuo, color=Conjunto)) +
+  geom_point(alpha=0.4, size=0.8) +
+  geom_hline(yintercept=0, color="red", linetype="dashed") +
+  facet_wrap(~Conjunto) +
+  scale_color_manual(values=c("Train"="#2980b9","Test"="#8e44ad"), guide="none") +
+  labs(title="Residuos — SVR RBF", x="Predicho", y="Residuo")
+
+grid.arrange(p1, p2, ncol=2)
+```
+
+**El gráfico Real vs Predicho**
+
+muestra que los puntos se distribuyen en torno a la línea diagonal de referencia (pendiente 1, intercepto 0) tanto en Train como en Test, confirmando que el modelo no presenta sesgo sistemático de sobreestimación ni subestimación a lo largo del rango de precios. La dispersión es homogénea en la zona central del rango log1p(precio), con mayor variabilidad en los extremos —precios muy bajos y muy altos— lo que es esperable dado que estos segmentos están subrepresentados en el dataset.
+
+**El gráfico de Residuos confirma este comportamiento:**
+
+la nube de puntos se centra en cero en ambos conjuntos, sin patrón sistemático visible (no hay forma de abanico ni curvatura), lo que indica homocedasticidad aproximada y ausencia de estructura no capturada por el modelo. La dispersión es levemente mayor en Test que en Train, consistente con la brecha de $\Delta R^2 = 0.044$ reportada en las métricas, pero sin constituir evidencia de sobreajuste relevante.
+
+
+```{r residuos-dist}
+
+df_res |> filter(Conjunto=="Test") |>
+  ggplot(aes(x=Residuo)) +
+  geom_density(fill="#8e44ad", alpha=0.6, linewidth=0.8) +
+  geom_vline(xintercept=0, linetype="dashed", color="red") +
+  labs(title="Distribución de Residuos — Test",
+       subtitle="Centrado en cero = sin sesgo sistemático",
+       x="Residuo (escala log1p)", y="Densidad")
+```
+
+La distribución de residuos sobre Test presenta forma acampanada centrada en cero, confirmando ausencia de sesgo sistemático: el modelo no sobreestima ni subestima el precio de forma consistente. La cola derecha es levemente más pesada que la izquierda, indicando que los errores de subestimación en precios altos son marginalmente más frecuentes que los de sobreestimación, comportamiento esperable dado que los alojamientos premium están subrepresentados en el dataset. La concentración de masa en torno a cero es consistente con el MAE de $0.2413$ reportado en Test.
+
+
+---
+
+# Predicciones en Escala Original
+
+```{r back-transform}
+
+pred_te_orig <- expm1(pred_te); real_te_orig <- expm1(y_te)
+
+cat(sprintf("Escala original — RMSE: %.0f CLP | MAE: %.0f CLP | R²: %.4f",
+            rmse_fn(real_te_orig,pred_te_orig),
+            mae_fn(real_te_orig, pred_te_orig),
+            r2_fn(real_te_orig,  pred_te_orig)))
+```
+
+Revertida la transformación log1p mediante `expm1`, el modelo obtiene en escala original un RMSE de 34.741 CLP, MAE de 16.161 CLP y $R^2 = 0.6984$. El MAE indica que el error absoluto promedio de predicción es de 16.161 CLP por noche, lo que representa una desviación moderada y operacionalmente aceptable considerando que el rango de precios del dataset oscila entre 1.000 y 500.000 CLP. El RMSE mayor al MAE refleja la presencia de errores grandes en alojamientos de precio extremo, consistente con la cola derecha observada en la distribución de residuos. El $R^2 = 0.6984$ confirma que el modelo explica el 69.8% de la varianza del precio en escala original, valor coherente con el $R^2 = 0.7058$ obtenido en escala log1p.
+
+```{r back-transform plot}
+
+ggplot(tibble(Real=real_te_orig, Pred=pred_te_orig), aes(x=Real, y=Pred)) +
+  geom_point(alpha=0.3, color="#2980b9", size=0.8) +
+  geom_abline(slope=1, intercept=0, color="#27ae60", linetype="dashed") +
+  scale_x_continuous(labels=comma) + scale_y_continuous(labels=comma) +
+  labs(title="Real vs Predicho — Escala Original CLP",
+       subtitle=paste0("RMSE: ", comma(round(rmse_fn(real_te_orig,pred_te_orig))),
+                       " CLP  |  R²: ", round(r2_fn(real_te_orig,pred_te_orig),4)),
+       x="Precio real (CLP/noche)", y="Precio predicho (CLP/noche)")
+```
+
+El gráfico Real vs Predicho en escala original CLP confirma el comportamiento esperado: en el rango de precios bajos y medios —donde se concentra la mayor densidad de observaciones— los puntos se distribuyen ajustadamente en torno a la línea de referencia, reflejando predicciones precisas. En el segmento premium, por encima de 200.000 CLP, la dispersión aumenta notoriamente y el modelo tiende a subestimar, lo que explica la brecha entre RMSE (34.741 CLP) y MAE (16.161 CLP): los errores grandes en precios altos inflan el RMSE sin afectar proporcionalmente el MAE. Este comportamiento es estructural al problema —los alojamientos de precio extremo son escasos en el dataset y presentan mayor heterogeneidad— y no constituye evidencia de falla del modelo sino de los límites naturales de la señal disponible.
+
+
+---
+
+# Generación de Datos Nuevos: Validación de Rendimiento
+
+> Los datos sintéticos permiten evaluar el comportamiento del modelo en condiciones controladas, simulando el escenario de producción. El pipeline completo (parámetros de Train) se aplica íntegramente.
+
+```{r new-data}
+
+set.seed(99); n_new <- 1000
+new_raw <- tibble(
+  accommodates                   = sample(1:10, n_new, replace=TRUE),
+  bathrooms_num                  = sample(c(1,1.5,2,2.5,3), n_new, replace=TRUE),
+  bedrooms                       = sample(1:5, n_new, replace=TRUE),
+  beds                           = sample(1:8, n_new, replace=TRUE),
+  minimum_nights                 = sample(1:30, n_new, replace=TRUE),
+  maximum_nights                 = sample(30:365, n_new, replace=TRUE),
+  number_of_reviews              = rpois(n_new, lambda=20),
+  review_scores_rating           = runif(n_new, 3.5, 5),
+  review_scores_cleanliness      = runif(n_new, 3.5, 5),
+  review_scores_location         = runif(n_new, 3.5, 5),
+  reviews_per_month              = runif(n_new, 0.1, 5),
+  calculated_host_listings_count = sample(1:20, n_new, replace=TRUE),
+  availability_365               = sample(0:365, n_new, replace=TRUE),
+  room_type = sample(unique(datos$room_type), n_new, replace=TRUE,
+                     prob=prop.table(table(datos$room_type))),
+  neighbourhood_cleansed = sample(unique(datos$neighbourhood_cleansed), n_new, replace=TRUE,
+                                  prob=prop.table(table(datos$neighbourhood_cleansed)))
+)
+
+dummies_new <- dummyVars(~room_type + neighbourhood_cleansed, data=new_raw, fullRank=TRUE)
+X_cat_new   <- predict(dummies_new, newdata=new_raw) |> as.data.frame()
+X_num_new   <- new_raw |> select(-room_type, -neighbourhood_cleansed)
+X_new_raw2  <- bind_cols(X_num_new, X_cat_new)
+
+cols_falt <- setdiff(names(X_tr_clean), names(X_new_raw2))
+for (col in cols_falt) X_new_raw2[[col]] <- 0
+X_new_norm    <- predict(pp_minmax, X_new_raw2[, names(X_tr_clean), drop=FALSE])
+X_new_sel     <- X_new_norm[, vars_sel]
+pred_new_orig <- expm1(predict(svr_tuned, newdata=X_new_sel))
+
+cat(sprintf("Datos nuevos — Precio predicho mediano: %s CLP/noche\nRango P10–P90: %s – %s CLP/noche",
+            comma(round(median(pred_new_orig))),
+            comma(round(quantile(pred_new_orig,0.1))),
+            comma(round(quantile(pred_new_orig,0.9)))))
+```
+
+Los resultados sobre datos sintéticos son congruentes con el comportamiento observado en Test. El precio predicho mediano de 42.021 CLP/noche es coherente con el perfil típico del dataset —alojamientos de capacidad media en comunas de precio moderado— y el rango P10–P90 de 20.215 a 89.449 CLP/noche refleja adecuadamente la dispersión natural del mercado Airbnb Santiago, donde la mayoría de los alojamientos se concentra en el segmento económico y medio. La amplitud del rango intercuartílico sintético es consistente con la distribución de predicciones sobre Test original, lo que confirma que el pipeline completo —Clean, MinMax, selección de features y SVR tuneado— generaliza de forma estable ante observaciones nuevas generadas bajo la misma distribución de origen.
+
+## Comparativa distribuciones: Test original vs Datos nuevos
+
+```{r compare-dist}
+
+bind_rows(
+  tibble(pred=pred_te_orig,  conjunto="Test original"),
+  tibble(pred=pred_new_orig, conjunto="Datos nuevos (sintéticos)")
+) |>
+  ggplot(aes(x=pred, fill=conjunto)) +
+  geom_density(alpha=0.55, linewidth=0.7) +
+  scale_fill_manual(values=c("#2980b9","#e74c3c")) +
+  scale_x_continuous(labels=comma) +
+  labs(title="Distribución predicciones: Test vs Datos Nuevos",
+       subtitle="Escala CLP/noche — consistencia distribucional del modelo",
+       x="Precio predicho (CLP/noche)", y="Densidad", fill="Conjunto")
+```
+
+Ambas distribuciones presentan alta superposición, con masa concentrada en el rango 20.000–80.000 CLP/noche y cola derecha larga hacia precios premium, lo que confirma consistencia distribucional entre el conjunto de Test original y los datos sintéticos. La distribución de datos nuevos replica fielmente la forma de Test, validando que el pipeline completo —Clean, MinMax, selección de features y SVR tuneado— produce predicciones estables ante observaciones no vistas generadas bajo la misma distribución de origen. La ligera diferencia en el pico de densidad refleja que los datos sintéticos fueron generados con distribuciones marginales independientes, sin capturar la correlación conjunta entre variables presente en el dataset real, lo que produce una concentración levemente mayor en el segmento económico. Esta divergencia es esperada y no constituye evidencia de inestabilidad del modelo.
+
+---
+
+# Accionabilidad — Predicciones SVR sobre Test
+
+> La accionabilidad se basa en las predicciones del SVR sobre el **conjunto de Test original**: observaciones reales, procesadas con el mismo pipeline (Clean → MinMax → Feature Selection), nunca vistas durante el entrenamiento.
+
+```{r accionabilidad-base}
+vars_orig_test <- c("room_type","neighbourhood_cleansed","accommodates","bedrooms")
+vars_ok        <- intersect(vars_orig_test, names(datos))
+
+datos_test_accion <- datos[-idx_tr, vars_ok, drop=FALSE] |>
+  mutate(
+    precio_real = real_te_orig,
+    precio_pred = pred_te_orig,
+    error_abs   = abs(precio_real - precio_pred),
+    segmento = case_when(
+      precio_pred >= quantile(pred_te_orig,0.75) ~ "🔴 Premium (Q4)",
+      precio_pred >= quantile(pred_te_orig,0.50) ~ "🟠 Alto (Q3)",
+      precio_pred >= quantile(pred_te_orig,0.25) ~ "🟡 Medio (Q2)",
+      TRUE                                        ~ "🟢 Económico (Q1)"
+    ),
+    segmento = factor(segmento, levels=c("🔴 Premium (Q4)","🟠 Alto (Q3)","🟡 Medio (Q2)","🟢 Económico (Q1)"))
+  )
+```
+
+## Segmentación y Framework de Intervención
+
+```{r segmentacion}
+
+datos_test_accion |>
+  group_by(segmento) |>
+  summarise(n            = n(),
+            precio_real  = round(median(precio_real)),
+            precio_pred  = round(median(precio_pred)),
+            error_mediano= round(median(error_abs)),
+            accommodates = round(mean(accommodates),1),
+            bedrooms     = round(mean(bedrooms),1),
+            .groups="drop") |>
+  kbl(caption="Perfil por segmento — predicciones SVR sobre Test original",
+      col.names=c("Segmento","N","Precio Real Mediano","Precio Pred. Mediano",
+                  "Error Mediano (CLP)","Huéspedes Prom.","Habitaciones Prom."),
+      format.args=list(big.mark=".")) |>
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE, font_size=12)
+```
+
+
+| Segmento | Precio Predicho | Perfil | Acción recomendada | Actor |
+|---|---|---|---|---|
+| 🔴 Premium | ≥ Q4 | Alta capacidad, barrio top | Optimización dinámica + fotografía profesional | Anfitrión / Plataforma |
+| 🟠 Alto | Q3 | Buenas reseñas, ubicación central | Paquetes estadía mínima extendida | Anfitrión |
+| 🟡 Medio | Q2 | Perfil estándar | Mejora amenities + aumento reseñas | Anfitrión |
+| 🟢 Económico | ≤ Q1 | Baja capacidad o periferia | Estrategia volumen + descuentos temporada | Anfitrión / Inversor |
+
+: Framework de intervención Airbnb {tbl-colwidths="[15,15,25,32,13]"}
+
+---
+
+# Resumen ejecutivo 
+```{r resumne ejecutivo , echo=FALSE}
+
+tibble(
+  Componente = c(
+    "Dataset","Variable objetivo","Features post-encoding (m)",
+    "Clean: constantes (std < 1e-8)","Clean: correladas (|r| ≥ 0.90)","Features limpias (q)",
+    "Normalización","Selectores evaluados","k*","Cálculo k*",
+    "Métrica de selección","Evaluador comparativa",
+    "Selector ganador","Features seleccionadas (p)",
+    "Algoritmo","Kernel","Mejor C","Mejor sigma",
+    "RMSE Test (log1p)","R² Test"
+  ),
+  Resultado = c(
+    paste0(nrow(datos)," listings × ",ncol(datos)," vars procesadas"),
+    "log1p(price) — precio CLP/noche",
+    as.character(ncol(X_m)),
+    paste0(length(vars_cte), if(length(vars_cte)==0)" (ninguna)" else ""),
+    as.character(length(vars_removed_corr)),
+    as.character(ncol(X_tr_clean)),
+    "MinMax [0,1] — parámetros de Train aplicados a Test",
+    "Fisher J | Elastic Net | B&B | XGBoost | Random Forest | SFS-SVR",
+    as.character(k_comun),
+    "max(round(mean(k_Fisher, k_ElasticNet, k_RF)), 4L) — consenso multimétodo",
+    "Score Ψ = 0.5·(1−RMSE_norm^CV) + 0.5·R²^CV | CV-5 sobre Train",
+    "SVR RBF fijo (C=5, γ=0.05, ε=0.1) — CV-5 estratificada sobre Train",
+    ganador,
+    paste0(length(vars_sel),": ",paste(vars_sel,collapse=" + ")),
+    "Support Vector Regression (SVR)",
+    "Radial Basis Function (RBF)",
+    as.character(svr_tuned$bestTune$C),
+    as.character(svr_tuned$bestTune$sigma),
+    round(rmse_fn(y_te,pred_te),4),
+    round(r2_fn(y_te,pred_te),4)
+  )
+) |>
+  kbl(caption="Resumen ejecutivo del proyecto") |>
+  kable_styling(bootstrap_options=c("striped","hover","condensed"), full_width=FALSE, font_size=12) |>
+  row_spec(c(6,11,12,13,14,19,20), bold=TRUE, background="#eaf2ff")
+```
+
+# Conclusiones
+
+El pipeline SVR aplicado al mercado Airbnb Santiago confirma que el precio es un fenómeno **no lineal y multidimensional**. El esquema Clean → Normalización MinMax → Selección Comparativa con seis selectores → SVR garantiza features óptimas sin data leakage y con justificación empírica rigurosa del selector ganador.
+
+La **estrategia de comparativa justa** — mismo $k^*$ consensuado, mismo SVR RBF con CV-5 sobre Train, Test sellado hasta la evaluación final — permite seleccionar el criterio de selección con rigor experimental. El **Score Ψ** provee una métrica única de decisión que combina RMSE y $R^2$ en escala normalizada $[0,1]$, eliminando la ambigüedad cuando ambas métricas no coinciden en el ranking.
+
+El k_comun por consenso (`mean` de Fisher J, Elastic Net y RF) es metodológicamente correcto para regresión Airbnb: a diferencia del problema de clasificación donde una variable dominante colapsa los k naturales, aquí no existe una sola feature dominante, por lo que el promedio entre criterios de distinta naturaleza (univariado, lineal penalizado, no lineal) refleja genuinamente el acuerdo entre enfoques.
+
+La variable **neighbourhood_cleansed** confirma ser de las más discriminantes, consistente con la lógica del mercado inmobiliario. Elastic Net es esencial para estabilizar la selección ante sus dummies correladas; SFS-SVR y XGBoost aportan la perspectiva no lineal que Fisher J no captura de forma univariada.
+
+**Sobre las comunas no seleccionadas y la interpretación de mercado.** De las comunas presentes en el dataset, los algoritmos de selección —y en particular el selector ganador S4 XGBoost— retuvieron únicamente Las Condes, Lo Barnechea, Providencia, Vitacura y Santiago. Esta selección no es arbitraria: refleja que estas son las únicas comunas cuyas dummies aportan poder discriminante estadísticamente relevante para separar los grupos extremos de precio (Q1 vs Q4). Las comunas excluidas no fueron descartadas por criterio editorial sino porque su señal de precio no difiere suficientemente del promedio regional como para que el evaluador SVR-CV5 las considere informativas bajo el umbral de selección.
+
+Las cuatro comunas del sector oriente —Las Condes, Lo Barnechea, Providencia y Vitacura— representan el segmento de mayor nivel adquisitivo del mercado Airbnb Santiago. Los alojamientos en estas comunas son preferidos por turistas y viajeros de negocios con poder de compra elevado, que priorizan ubicación premium, seguridad, acceso a servicios de alta gama y calidad de las prestaciones por sobre el precio. Esta demanda selectiva sostiene precios sistemáticamente superiores al promedio regional, lo que explica su alta capacidad discriminante ($J_F$ elevado) y su retención por todos los selectores no lineales. Santiago centro, en cambio, es retenido por su alta **heterogeneidad interna**: concentra simultáneamente alojamientos económicos y premium, generando la mayor dispersión entre quintiles extremos ($J_F = 0.736$, el más alto del conjunto), lo que lo convierte en una variable de alta discriminación no por precio alto sino por variabilidad estructural del mercado.
+
+Las comunas excluidas —Ñuñoa, La Florida, Maipú, entre otras— presentan distribuciones de precio más homogéneas y cercanas a la media regional, sin la concentración premium del sector oriente ni la heterogeneidad de Santiago centro. Para el modelo SVR, incluirlas no reduciría el error de predicción porque su señal geográfica no es suficientemente distinta de la línea base. En términos de mercado, esto confirma que el precio Airbnb en Santiago está fuertemente segmentado por eje geográfico y nivel socioeconómico del entorno, y que los algoritmos de selección de características capturan esta estructura de mercado de forma cuantitativa y reproducible.
+
+---
+
+# Referencias
+
+- **Vapnik, V.** (1995). *The Nature of Statistical Learning Theory*. Springer.
+- **Smola, A. & Schölkopf, B.** (2004). A tutorial on support vector regression. *Statistics and Computing*, 14, 199–222.
+- **Guyon, I. & Elisseeff, A.** (2003). An introduction to variable and feature selection. *JMLR*, 3, 1157–1182.
+- **Chen, T. & Guestrin, C.** (2016). XGBoost: A scalable tree boosting system. *KDD*.
+- **Zou, H. & Hastie, T.** (2005). Regularization and variable selection via the elastic net. *JRSS-B*, 67(2), 301–320.
+- **Breiman, L.** (2001). Random Forests. *Machine Learning*, 45, 5–32.
+- **Inside Airbnb.** (2024). Santiago de Chile listings data. <http://insideairbnb.com>
+- **Meyer, D. et al.** (2023). e1071. R package. | **Kuhn, M.** (2023). caret. R package.
+
+---
+
+*Documento generado con Quarto · R · ggplot2 · e1071 · caret · randomForest · xgboost · glmnet · igraph · kableExtra*  
+*Alejandro Figueroa Rojas — Data & Business Intelligence*

@@ -1,106 +1,107 @@
 # SVR Regression · Airbnb Santiago Pricing
 
-**Support Vector Regression applied to short-term rental price prediction — Santiago, Chile (Inside Airbnb, Dec 2024)**
+**Support Vector Regression aplicado a predicción de precios de alojamiento — Santiago, Chile (Inside Airbnb, dic. 2024)**
 
 ---
 
-## Overview
+## Descripción
 
-End-to-end machine learning pipeline that predicts Airbnb listing prices in Santiago using **SVR with RBF kernel**, covering data preprocessing, comparative feature selection across six methods, hyperparameter tuning, and operational deployment on unseen data.
+Pipeline de machine learning end-to-end que predice el precio de publicación de listings Airbnb en Santiago usando **SVR con kernel RBF**, cubriendo preprocesamiento, selección comparativa de características entre seis métodos, tuning de hiperparámetros y validación sobre datos no vistos.
 
-**Test performance:** RMSE = 0.3544 (log1p) · R² = 0.706 · MAE ≈ CLP 16,161/night
+**Rendimiento en Test:** RMSE = 0.3544 (log1p) · R² = 0.706 · MAE ≈ CLP 16.161/noche
 
 ---
 
 ## Pipeline
 
 ```
-Raw Data → Price Filter → EDA → Encoding → Train/Test Split
-→ Clean Algorithm → MinMax Normalization → Comparative Feature Selection → SVR Tuning → Evaluation
+Raw Data → Filtro Precio → EDA → Encoding → Train/Test Split
+→ Clean Algorithm → Normalización MinMax → Selección Comparativa → SVR Tuning → Evaluación
 ```
 
-| Phase | Steps |
+| Fase | Pasos |
 |---|---|
-| Data & EDA | Load · Inventory · Categorization · Price filter · OHE |
-| Preprocessing | Clean Algorithm (constant + correlated features) · MinMax normalization (Train-only) |
-| Feature Selection | 6 selectors · shared k\* · CV-5 on Train only |
-| Modeling | SVR RBF · Grid Search · Cross-validation |
-| Evaluation | Train/Test metrics · Residual analysis · Back-transform to CLP |
-| Operation | Synthetic new data · Segmentation · Intervention framework |
+| Datos & EDA | Carga · Inventario · Categorización · Filtro precio · OHE |
+| Preprocesamiento | Clean Algorithm (constantes + correladas) · MinMax solo en Train |
+| Selección features | 6 selectores · k\* compartido · CV-5 exclusivo en Train |
+| Modelamiento | SVR RBF · Grid Search · Validación cruzada |
+| Evaluación | Métricas Train/Test · Residuos · Back-transform a CLP |
+| Operación | Datos nuevos sintéticos · Segmentación · Framework de intervención |
 
 ---
 
-## Feature Selection — Comparative Strategy
+## Selección de Características — Estrategia Comparativa
 
-Six selectors compete under identical conditions: same **k\* = 23** (consensus across Fisher J, Elastic Net, Random Forest natural k), same SVR evaluator (C=5, γ=0.05, ε=0.1), CV-5 exclusively on Train. Test is sealed until final evaluation.
+Seis selectores compiten bajo condiciones idénticas: mismo **k\* = 23** (consenso entre k naturales de Fisher J, Elastic Net y Random Forest), mismo evaluador SVR (C=5, γ=0.05, ε=0.1), CV-5 exclusivamente sobre Train. Test permanece sellado hasta la evaluación final.
 
-| Selector | Type | Ψ Score |
+| Selector | Tipo | Score Ψ |
 |---|---|---|
-| **S4 — XGBoost (Gain)** ✔ | Embedded · nonlinear | **0.8496** |
-| S5 — Random Forest | Embedded · permutation | 0.8446 |
+| **S4 — XGBoost (Gain)** ✔ | Embedded · no lineal | **0.8496** |
+| S5 — Random Forest | Embedded · permutación | 0.8446 |
 | S6 — SFS-SVR | Wrapper · greedy | 0.8416 |
-| S3 — Branch & Bound | Filter · multivariate | 0.8376 |
+| S3 — Branch & Bound | Filter · multivariado | 0.8376 |
 | S2 — Elastic Net | Embedded · L1+L2 | 0.8331 |
-| S1 — Fisher J | Filter · univariate | 0.8301 |
+| S1 — Fisher J | Filter · univariado | 0.8301 |
 
-**Winner selection criterion:**
+**Criterio de selección del ganador:**
 $$\Psi_s = \frac{1}{2}\left(1 - \frac{\text{RMSE}_s^{CV} - \min\text{RMSE}^{CV}}{\max\text{RMSE}^{CV} - \min\text{RMSE}^{CV}}\right) + \frac{1}{2} \cdot R^{2,CV}_s$$
 
 ---
 
-## Key Results
+## Resultados
 
-| Metric | Train | Test |
+| Métrica | Train | Test |
 |---|---|---|
 | RMSE (log1p) | 0.3251 | 0.3544 |
 | MAE (log1p) | — | 0.2413 |
 | R² | 0.7492 | 0.7058 |
-| RMSE (CLP) | — | ~34,741 |
-| MAE (CLP) | — | ~16,161 |
+| RMSE (CLP) | — | ~34.741 |
+| MAE (CLP) | — | ~16.161 |
 
-Train–Test gap: ΔR² = 0.044 · No relevant overfitting detected.
+Brecha Train–Test: ΔR² = 0.044 · Sin sobreajuste relevante.
 
 ---
 
-## Geographic Insight
+## Análisis Geográfico
 
-The model identified **5 communes** with statistically significant price discrimination power. The map below shows their Fisher J scores over the official RM cartography.
+El modelo identificó **5 comunas** con poder de discriminación de precio estadísticamente significativo. El mapa muestra sus scores Fisher J sobre la cartografía oficial de la Región Metropolitana.
 
 ![Georreferenciación comunas seleccionadas — Región Metropolitana](georef_comunas_RM.png)
 
-> Communes retained by XGBoost (Gain): **Las Condes · Lo Barnechea · Providencia · Vitacura · Santiago**. Exclusions are data-driven, not editorial — communes with homogeneous price distributions relative to the regional baseline add no predictive value under SVR-CV5 evaluation.
+> Comunas retenidas por XGBoost (Gain): **Las Condes · Lo Barnechea · Providencia · Vitacura · Santiago**. Las exclusiones son basadas en datos, no editoriales: comunas con distribuciones de precio homogéneas respecto a la línea base regional no aportan valor predictivo bajo el evaluador SVR-CV5.
 
 ---
 
 ## Stack
 
-| Layer | Tools |
+| Capa | Herramientas |
 |---|---|
-| Language | R 4.x |
-| Modeling | `e1071` · `caret` |
-| Feature Selection | `glmnet` · `randomForest` · `xgboost` · custom Fisher J / B&B / SFS |
-| Visualization | `ggplot2` · `chilemapas` · `sf` · `igraph` |
-| Report | Quarto (`.qmd`) → self-contained HTML |
+| Lenguaje | R 4.x |
+| Modelamiento | `e1071` · `caret` |
+| Selección features | `glmnet` · `randomForest` · `xgboost` · Fisher J / B&B / SFS custom |
+| Visualización | `ggplot2` · `chilemapas` · `sf` · `igraph` |
+| Reporte | Quarto (`.qmd`) → HTML autocontenido |
 
 ---
 
-## Repository Structure
+## Estructura del Repositorio
 
 ```
-├── SVM_REGRESION.qmd          # Full reproducible report (Quarto)
-├── listings.csv.gz            # Raw data — Inside Airbnb Santiago (Dec 2024)
-├── georef_comunas_RM.png      # Geographic visualization — selected communes
+├── SVM_REGRESION.qmd          # Reporte reproducible completo (Quarto)
+├── listings.csv.gz            # Datos brutos — Inside Airbnb Santiago (dic. 2024)
+├── georef_comunas_RM.png      # Mapa georreferenciado — comunas seleccionadas
 └── README.md
 ```
 
-> **To render:** update the `listings.csv.gz` path in chunk `load-raw`, then run `quarto render SVM_REGRESION.qmd`.
+> **Para renderizar:** actualizar la ruta de `listings.csv.gz` en el chunk `load-raw` y ejecutar `quarto render SVM_REGRESION.qmd`.
 
 ---
 
-## Data Source
+## Fuente de Datos
 
-[Inside Airbnb — Santiago de Chile](https://insideairbnb.com/get-the-data/) · December 2024
+[Inside Airbnb — Santiago de Chile](https://insideairbnb.com/get-the-data/) · Diciembre 2024
 
 ---
 
-*Alejandro Figueroa Rojas · Data & Business Intelligence*
+*Alejandro Figueroa Rojas · Data & Business Intelligence*  
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-Alejandro%20Figueroa%20Rojas-0077B5?style=flat&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/alejandrofigueroarojas)
